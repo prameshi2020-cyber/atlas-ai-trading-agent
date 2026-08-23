@@ -1,16 +1,40 @@
-"""
-ATLAS - Autonomous Trading & Liquidity Analysis System
+import asyncio
+import logging
 
-Application entry point.
-"""
+from app.config.settings import settings
+from app.database.models import initialize_database
+from app.market.collector import MarketCollector
+from app.market.coingecko import CoinGeckoProvider
 
 
-def main() -> None:
-    print("=" * 50)
-    print("ATLAS AI Trading Agent")
-    print("System starting...")
-    print("=" * 50)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+
+async def main() -> None:
+    print("=" * 60)
+    print(f"{settings.app_name} AI Trading Agent")
+    print(f"Environment: {settings.environment}")
+    print("=" * 60)
+
+    initialize_database()
+
+    provider = CoinGeckoProvider()
+
+    collector = MarketCollector(
+        provider=provider,
+        symbols=[
+            "BTCUSDT",
+            "ETHUSDT",
+            "SOLUSDT",
+        ],
+        interval_seconds=60,
+    )
+
+    await collector.run()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
