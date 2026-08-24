@@ -1,5 +1,5 @@
 from app.database.connection import get_connection
-from app.market.models import Ticker
+from app.market.models import Ticker, Candle
 
 
 def initialize_database() -> None:
@@ -63,6 +63,128 @@ def save_ticker(ticker: Ticker) -> None:
         )
 
         connection.commit()
+
+    finally:
+        connection.close()
+
+
+def initialize_candle_database() -> None:
+    connection = get_connection()
+
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_candles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                volume REAL NOT NULL,
+                timestamp TEXT NOT NULL,
+                UNIQUE(symbol, timeframe, timestamp)
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_market_candles_symbol_timeframe_timestamp
+            ON market_candles(symbol, timeframe, timestamp)
+            """
+        )
+
+        connection.commit()
+
+    finally:
+        connection.close()
+
+
+def save_candle(candle: Candle) -> None:
+    connection = get_connection()
+
+    try:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO market_candles (
+                symbol,
+                timeframe,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                timestamp
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                candle.symbol,
+                candle.timeframe,
+                candle.open,
+                candle.high,
+                candle.low,
+                candle.close,
+                candle.volume,
+                candle.timestamp.isoformat(),
+            ),
+        )
+
+        connection.commit()
+
+    finally:
+        connection.close()
+
+
+def save_candles(candles: list[Candle]) -> int:
+    """
+    Save multiple candles.
+
+    Returns the number of newly inserted candles.
+    Existing candles are ignored because of the UNIQUE constraint.
+    """
+    if not candles:
+        return 0
+
+    connection = get_connection()
+
+    try:
+        inserted = 0
+
+        for candle in candles:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO market_candles (
+                    symbol,
+                    timeframe,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    timestamp
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candle.symbol,
+                    candle.timeframe,
+                    candle.open,
+                    candle.high,
+                    candle.low,
+                    candle.close,
+                    candle.volume,
+                    candle.timestamp.isoformat(),
+                ),
+            )
+
+            inserted += cursor.rowcount
+
+        connection.commit()
+        return inserted
 
     finally:
         connection.close()

@@ -11,3 +11,15 @@ class Ticker:
     low_24h: float
     volume_24h: float
     timestamp: datetime
+
+
+@dataclass(slots=True)
+class Candle:
+    symbol: str
+    timeframe: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    timestamp: datetime

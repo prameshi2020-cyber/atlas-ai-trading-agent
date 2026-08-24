@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from app.database.models import save_ticker
+from app.database.models import save_ticker, save_candle
 from app.market.base import MarketDataProvider
 
 
@@ -21,24 +21,70 @@ class MarketCollector:
         self.interval_seconds = interval_seconds
 
     async def collect_once(self) -> None:
-        for symbol in self.symbols:
-            try:
-                ticker = await self.provider.get_ticker(symbol)
-                save_ticker(ticker)
+        # -------------------------
+        # Tickers
+        # -------------------------
+        try:
+            tickers = await self.provider.get_tickers(self.symbols)
 
-                logger.info(
-                    "Collected %s: $%.2f",
-                    ticker.symbol,
-                    ticker.price,
-                )
+            for ticker in tickers:
+                try:
+                    save_ticker(ticker)
 
-            except Exception:
-                logger.exception(
-                    "Failed to collect %s",
-                    symbol,
-                )
+                    logger.info(
+                        "Collected %s ticker: $%.2f",
+                        ticker.symbol,
+                        ticker.price,
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Failed to save ticker %s",
+                        ticker.symbol,
+                    )
+
+        except Exception:
+            logger.exception("Failed to collect tickers")
+
+        # -------------------------
+        # Candles
+        # -------------------------
+        try:
+            candles = await self.provider.get_candles(
+                self.symbols,
+                timeframe="1m",
+            )
+
+            for candle in candles:
+                try:
+                    save_candle(candle)
+
+                    logger.info(
+                        "Collected %s 1m candle: "
+                        "O=%.2f H=%.2f L=%.2f C=%.2f V=%.2f",
+                        candle.symbol,
+                        candle.open,
+                        candle.high,
+                        candle.low,
+                        candle.close,
+                        candle.volume,
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Failed to save candle %s",
+                        candle.symbol,
+                    )
+
+        except Exception:
+            logger.exception("Failed to collect candles")
 
     async def run(self) -> None:
-        while True:
-            await self.collect_once()
-            await asyncio.sleep(self.interval_seconds)
+        try:
+            while True:
+                await self.collect_once()
+                await asyncio.sleep(self.interval_seconds)
+
+        except asyncio.CancelledError:
+            logger.info("MarketCollector stopped by cancellation.")
+            return
