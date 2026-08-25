@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from app.analysis.strategy import StrategyEngine
+from app.analysis.indicators import REQUIRED_FEATURE_COLUMNS, drop_warmup_rows
 
 
 @dataclass(slots=True)
@@ -74,6 +75,41 @@ class BacktestEngine:
     - Long/short positions
     - Equity tracking
     - Performance statistics
+
+    CAUSAL EXECUTION MODEL
+    -----------------------
+    For a decision made at candle i (closed):
+        1. The strategy sees only data.iloc[: i + 1]      (candles <= i)
+        2. Any resulting entry/exit executes at candle i+1's OPEN
+        3. Candle i+1's HIGH/LOW/CLOSE are then used to:
+             - evaluate whether a stop-loss / take-profit on any
+               position (including one just opened this same bar)
+               was touched during candle i+1, and
+             - mark the position to market at candle i+1's CLOSE.
+    Candle i+1 is fully known/closed by the time step 3 runs, so this
+    does not introduce look-ahead: candle i+1's open was already being
+    used for execution and its close was already being used for
+    mark-to-market before this fix, so using its high/low for
+    intrabar risk is consistent, not an extension into the future.
+
+    ENTRY-BAR STOP-LOSS / TAKE-PROFIT
+    -----------------------------------
+    A position opened at candle N's open is evaluated against candle
+    N's own high/low for a stop-loss or take-profit hit, in the same
+    step it was opened. (Previously this engine only checked SL/TP
+    starting from the bar *after* entry, meaning a stop breached
+    within the entry candle itself was never detected -- a bug fixed
+    in this version.)
+
+    SAME-BAR STOP-LOSS / TAKE-PROFIT AMBIGUITY POLICY
+    -----------------------------------------------------
+    OHLC data alone cannot tell us whether price touched the
+    stop-loss or the take-profit level *first* within a single
+    candle when both levels fall inside that candle's [low, high]
+    range. This engine resolves that ambiguity deterministically and
+    conservatively: STOP-LOSS always takes priority over TAKE-PROFIT
+    when both are touched in the same candle. This never assumes the
+    more favorable outcome for the trader. See `_evaluate_exit`.
     """
 
     def __init__(
@@ -165,6 +201,76 @@ class BacktestEngine:
         return net_return * 100
 
     # ---------------------------------------------------------
+    # Stop-loss / take-profit evaluation
+    # ---------------------------------------------------------
+
+    def _evaluate_exit(
+        self,
+        position: str,
+        entry_price: float | None,
+        entry_atr: float | None,
+        bar_high: float,
+        bar_low: float,
+    ) -> tuple[float | None, str | None]:
+        """
+        Check whether `position` (opened at `entry_price`, sized off
+        `entry_atr`) had its stop-loss or take-profit touched within
+        a single bar's [bar_low, bar_high] range.
+
+        Returns (exit_price, exit_reason), or (None, None) if neither
+        level was touched.
+
+        A position can never be evaluated without a known ATR: if
+        `entry_atr` is missing or NaN, this method returns (None,
+        None) rather than guessing -- callers must not open a
+        position without a real ATR in the first place (see `run`),
+        so this is a defensive backstop, not the primary guard. A NaN
+        ATR must never be silently treated as "no stop" while still
+        allowing a position to trade.
+
+        CONSERVATIVE SAME-BAR POLICY: if both the stop-loss and the
+        take-profit level fall inside the same bar's range, OHLC data
+        cannot tell us which was touched first intrabar. This method
+        always resolves that ambiguity in favor of STOP_LOSS -- it
+        never assumes the more favorable outcome for the trader.
+        """
+        if pd.isna(entry_price) or pd.isna(entry_atr):
+            return None, None
+
+        stop_price: float | None = None
+        target_price: float | None = None
+
+        if position == "LONG":
+            if self.stop_loss_atr is not None:
+                stop_price = entry_price - entry_atr * self.stop_loss_atr
+
+            if self.take_profit_atr is not None:
+                target_price = entry_price + entry_atr * self.take_profit_atr
+
+            # Stop-loss checked first: conservative same-bar priority.
+            if stop_price is not None and bar_low <= stop_price:
+                return stop_price, "STOP_LOSS"
+
+            if target_price is not None and bar_high >= target_price:
+                return target_price, "TAKE_PROFIT"
+
+        else:  # SHORT
+            if self.stop_loss_atr is not None:
+                stop_price = entry_price + entry_atr * self.stop_loss_atr
+
+            if self.take_profit_atr is not None:
+                target_price = entry_price - entry_atr * self.take_profit_atr
+
+            # Stop-loss checked first: conservative same-bar priority.
+            if stop_price is not None and bar_high >= stop_price:
+                return stop_price, "STOP_LOSS"
+
+            if target_price is not None and bar_low <= target_price:
+                return target_price, "TAKE_PROFIT"
+
+        return None, None
+
+    # ---------------------------------------------------------
     # Run backtest
     # ---------------------------------------------------------
 
@@ -180,9 +286,12 @@ class BacktestEngine:
         if len(features) < 3:
             raise ValueError("At least 3 rows are required")
 
-        if "atr_14" not in features.columns:
+        missing_columns = set(REQUIRED_FEATURE_COLUMNS) - set(features.columns)
+
+        if missing_columns:
             raise ValueError(
-                "Feature dataframe must contain atr_14"
+                f"Feature dataframe is missing required columns: "
+                f"{sorted(missing_columns)}"
             )
 
         data = (
@@ -191,6 +300,30 @@ class BacktestEngine:
             .sort_values("timestamp")
             .reset_index(drop=True)
         )
+
+        # -----------------------------------------------------
+        # Warm-up handling (see class docstring / indicators.py)
+        # -----------------------------------------------------
+        #
+        # Rows where any required indicator is still NaN (the
+        # rolling/EWM warm-up period -- e.g. the first ~49 rows for
+        # sma_50) are dropped here, BEFORE the strategy ever sees
+        # them. Without this, NaN comparisons inside the strategy
+        # (e.g. `ema_9 > ema_21`) silently evaluate to False in
+        # Python, fabricating a bearish signal out of "no data yet"
+        # instead of correctly abstaining. This also guarantees
+        # entry_atr below can never be NaN, so a stop-loss can never
+        # be silently disabled.
+
+        data = drop_warmup_rows(data)
+
+        if len(data) < 3:
+            raise ValueError(
+                "At least 3 fully warmed-up rows are required after "
+                "dropping indicator warm-up rows (need candles beyond "
+                "the longest indicator lookback window, e.g. sma_50's "
+                "50-candle window)"
+            )
 
         capital = self.initial_capital
 
@@ -209,6 +342,17 @@ class BacktestEngine:
         # -----------------------------------------------------
         # Main loop
         # -----------------------------------------------------
+        #
+        # For iteration i:
+        #   1. signal is generated from data.iloc[: i + 1]  (causal)
+        #   2. any entry/exit/reversal executes at data.iloc[i+1]'s
+        #      open
+        #   3. data.iloc[i+1]'s high/low is checked for a stop-loss
+        #      / take-profit hit against BOTH a pre-existing position
+        #      AND a position opened/reversed into on this very
+        #      iteration -- this is the entry-bar SL/TP fix.
+        #   4. data.iloc[i+1]'s close marks the resulting position
+        #      to market.
 
         for i in range(len(data) - 1):
 
@@ -220,114 +364,31 @@ class BacktestEngine:
                 features=data.iloc[: i + 1],
             )
 
-            next_open = float(
-                next_candle["open"]
-            )
+            next_open = float(next_candle["open"])
+            bar_high = float(next_candle["high"])
+            bar_low = float(next_candle["low"])
+            next_time = next_candle["timestamp"]
 
-            high = float(
-                next_candle["high"]
-            )
-
-            low = float(
-                next_candle["low"]
-            )
-
-            atr = float(
-                current["atr_14"]
-            )
+            # atr_14 is guaranteed non-NaN here: drop_warmup_rows()
+            # already removed every row where it (or any other
+            # required indicator) was missing.
+            atr_value = current["atr_14"]
+            atr = None if pd.isna(atr_value) else float(atr_value)
 
             # -------------------------------------------------
-            # Manage existing position
+            # Step 1: manage a position opened on a PRIOR bar
+            # against THIS bar's high/low.
             # -------------------------------------------------
 
             if position is not None:
 
-                stop_price = None
-                target_price = None
-
-                if (
-                    entry_price is not None
-                    and entry_atr is not None
-                ):
-
-                    if position == "LONG":
-
-                        if self.stop_loss_atr is not None:
-                            stop_price = (
-                                entry_price
-                                - entry_atr
-                                * self.stop_loss_atr
-                            )
-
-                        if self.take_profit_atr is not None:
-                            target_price = (
-                                entry_price
-                                + entry_atr
-                                * self.take_profit_atr
-                            )
-
-                    else:
-
-                        if self.stop_loss_atr is not None:
-                            stop_price = (
-                                entry_price
-                                + entry_atr
-                                * self.stop_loss_atr
-                            )
-
-                        if self.take_profit_atr is not None:
-                            target_price = (
-                                entry_price
-                                - entry_atr
-                                * self.take_profit_atr
-                            )
-
-                exit_price = None
-                exit_reason = None
-
-                # ---------------------------------------------
-                # LONG risk management
-                # ---------------------------------------------
-
-                if position == "LONG":
-
-                    if (
-                        stop_price is not None
-                        and low <= stop_price
-                    ):
-                        exit_price = stop_price
-                        exit_reason = "STOP_LOSS"
-
-                    elif (
-                        target_price is not None
-                        and high >= target_price
-                    ):
-                        exit_price = target_price
-                        exit_reason = "TAKE_PROFIT"
-
-                # ---------------------------------------------
-                # SHORT risk management
-                # ---------------------------------------------
-
-                else:
-
-                    if (
-                        stop_price is not None
-                        and high >= stop_price
-                    ):
-                        exit_price = stop_price
-                        exit_reason = "STOP_LOSS"
-
-                    elif (
-                        target_price is not None
-                        and low <= target_price
-                    ):
-                        exit_price = target_price
-                        exit_reason = "TAKE_PROFIT"
-
-                # ---------------------------------------------
-                # Close position due to SL/TP
-                # ---------------------------------------------
+                exit_price, exit_reason = self._evaluate_exit(
+                    position,
+                    entry_price,
+                    entry_atr,
+                    bar_high,
+                    bar_low,
+                )
 
                 if exit_price is not None:
 
@@ -355,7 +416,7 @@ class BacktestEngine:
                             symbol=symbol,
                             side=position,
                             entry_time=entry_time,
-                            exit_time=next_candle["timestamp"],
+                            exit_time=next_time,
                             entry_price=entry_price,
                             exit_price=exit_price,
                             pnl_pct=pnl_pct,
@@ -371,10 +432,23 @@ class BacktestEngine:
 
                     equity_curve.append(capital)
 
+                    # No new entry on the same bar that stopped us
+                    # out, consistent with this engine's existing
+                    # one-decision-per-bar convention.
                     continue
 
             # -------------------------------------------------
-            # Signal-based position changes
+            # Step 2: signal-driven open / reverse. Entry (and a
+            # reversal's exit) execute at next_open -- candle
+            # i+1's open.
+            #
+            # A BUY/SELL signal with no valid ATR (atr is None)
+            # is intentionally NOT traded: opening a position
+            # without a real ATR would mean an untracked,
+            # unprotected stop-loss. In the normal pipeline this
+            # branch is unreachable because drop_warmup_rows()
+            # already guarantees atr_14 is always valid here; it
+            # exists as a defensive backstop.
             # -------------------------------------------------
 
             if signal.action == "BUY":
@@ -382,20 +456,19 @@ class BacktestEngine:
                 # Open LONG
                 if position is None:
 
-                    position = "LONG"
+                    if atr is not None:
 
-                    entry_price = (
-                        self._apply_entry_slippage(
-                            "LONG",
-                            next_open,
+                        position = "LONG"
+
+                        entry_price = (
+                            self._apply_entry_slippage(
+                                "LONG",
+                                next_open,
+                            )
                         )
-                    )
 
-                    entry_time = (
-                        next_candle["timestamp"]
-                    )
-
-                    entry_atr = atr
+                        entry_time = next_time
+                        entry_atr = atr
 
                 # SHORT -> LONG
                 elif position == "SHORT":
@@ -426,7 +499,7 @@ class BacktestEngine:
                             symbol=symbol,
                             side="SHORT",
                             entry_time=entry_time,
-                            exit_time=next_candle["timestamp"],
+                            exit_time=next_time,
                             entry_price=entry_price,
                             exit_price=exit_price,
                             pnl_pct=pnl_pct,
@@ -435,40 +508,45 @@ class BacktestEngine:
                         )
                     )
 
-                    position = "LONG"
+                    if atr is not None:
 
-                    entry_price = (
-                        self._apply_entry_slippage(
-                            "LONG",
-                            next_open,
+                        position = "LONG"
+
+                        entry_price = (
+                            self._apply_entry_slippage(
+                                "LONG",
+                                next_open,
+                            )
                         )
-                    )
 
-                    entry_time = (
-                        next_candle["timestamp"]
-                    )
+                        entry_time = next_time
+                        entry_atr = atr
 
-                    entry_atr = atr
+                    else:
+
+                        position = None
+                        entry_price = None
+                        entry_time = None
+                        entry_atr = None
 
             elif signal.action == "SELL":
 
                 # Open SHORT
                 if position is None:
 
-                    position = "SHORT"
+                    if atr is not None:
 
-                    entry_price = (
-                        self._apply_entry_slippage(
-                            "SHORT",
-                            next_open,
+                        position = "SHORT"
+
+                        entry_price = (
+                            self._apply_entry_slippage(
+                                "SHORT",
+                                next_open,
+                            )
                         )
-                    )
 
-                    entry_time = (
-                        next_candle["timestamp"]
-                    )
-
-                    entry_atr = atr
+                        entry_time = next_time
+                        entry_atr = atr
 
                 # LONG -> SHORT
                 elif position == "LONG":
@@ -499,7 +577,7 @@ class BacktestEngine:
                             symbol=symbol,
                             side="LONG",
                             entry_time=entry_time,
-                            exit_time=next_candle["timestamp"],
+                            exit_time=next_time,
                             entry_price=entry_price,
                             exit_price=exit_price,
                             pnl_pct=pnl_pct,
@@ -508,23 +586,90 @@ class BacktestEngine:
                         )
                     )
 
-                    position = "SHORT"
+                    if atr is not None:
 
-                    entry_price = (
-                        self._apply_entry_slippage(
-                            "SHORT",
-                            next_open,
+                        position = "SHORT"
+
+                        entry_price = (
+                            self._apply_entry_slippage(
+                                "SHORT",
+                                next_open,
+                            )
+                        )
+
+                        entry_time = next_time
+                        entry_atr = atr
+
+                    else:
+
+                        position = None
+                        entry_price = None
+                        entry_time = None
+                        entry_atr = None
+
+            # -------------------------------------------------
+            # Step 3: THE FIX -- if a position was opened or
+            # reversed into on THIS bar (step 2), check the SAME
+            # bar's high/low for an entry-bar stop-loss / take
+            # -profit hit. `entry_time == next_time` identifies a
+            # position that was just opened this iteration (a
+            # position carried over from a prior bar would have
+            # an earlier entry_time, and was already handled --
+            # or closed -- in step 1 above).
+            # -------------------------------------------------
+
+            if position is not None and entry_time == next_time:
+
+                exit_price, exit_reason = self._evaluate_exit(
+                    position,
+                    entry_price,
+                    entry_atr,
+                    bar_high,
+                    bar_low,
+                )
+
+                if exit_price is not None:
+
+                    exit_price = self._apply_exit_slippage(
+                        position,
+                        exit_price,
+                    )
+
+                    pnl_pct = self._calculate_pnl(
+                        position,
+                        entry_price,
+                        exit_price,
+                    )
+
+                    pnl_amount = (
+                        capital
+                        * pnl_pct
+                        / 100
+                    )
+
+                    capital += pnl_amount
+
+                    trades.append(
+                        BacktestTrade(
+                            symbol=symbol,
+                            side=position,
+                            entry_time=entry_time,
+                            exit_time=next_time,
+                            entry_price=entry_price,
+                            exit_price=exit_price,
+                            pnl_pct=pnl_pct,
+                            pnl_amount=pnl_amount,
+                            exit_reason=exit_reason,
                         )
                     )
 
-                    entry_time = (
-                        next_candle["timestamp"]
-                    )
-
-                    entry_atr = atr
+                    position = None
+                    entry_price = None
+                    entry_time = None
+                    entry_atr = None
 
             # -------------------------------------------------
-            # Mark-to-market equity
+            # Step 4: mark-to-market equity
             # -------------------------------------------------
 
             mark_price = float(

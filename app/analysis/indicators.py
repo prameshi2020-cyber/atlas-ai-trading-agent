@@ -231,3 +231,71 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     return result
+
+
+# ---------------------------------------------------------------------
+# Warm-up handling
+# ---------------------------------------------------------------------
+#
+# The rolling/EWM windows above need a minimum number of prior candles
+# before they produce a real value (e.g. sma_50 needs 50 candles, so
+# the first 49 rows are NaN by construction -- this is correct and
+# expected, not a bug in calculate_indicators()).
+#
+# The bug is downstream: naive comparisons like
+#   row["ema_9"] > row["ema_21"]
+# silently evaluate to False when either side is NaN, which biases
+# every warm-up row toward a fabricated bearish signal instead of an
+# honest "not enough data yet". REQUIRED_FEATURE_COLUMNS and
+# drop_warmup_rows() let callers (the backtest engine, in particular)
+# strip those rows out *before* they ever reach StrategyEngine, so no
+# trading decision is ever generated from incomplete indicator data.
+
+# Every column StrategyEngine.generate_signal() reads from the latest
+# row, plus atr_14 which BacktestEngine needs for stop-loss /
+# take-profit sizing. sma_50 has the longest warm-up window (50
+# candles) and is therefore the binding constraint in practice.
+REQUIRED_FEATURE_COLUMNS: tuple[str, ...] = (
+    "ema_9",
+    "ema_21",
+    "sma_50",
+    "rsi_14",
+    "macd_histogram",
+    "atr_14",
+    "price_vs_ema21",
+    "price_vs_sma50",
+    "momentum_10",
+    "momentum_20",
+)
+
+
+def drop_warmup_rows(
+    df: pd.DataFrame,
+    required_columns: tuple[str, ...] = REQUIRED_FEATURE_COLUMNS,
+) -> pd.DataFrame:
+    """
+    Remove rows that do not yet have every required indicator value
+    populated.
+
+    This is a deterministic, order-preserving filter: it keeps every
+    row where all `required_columns` are non-NaN, and drops the rest.
+    In the normal case (indicators computed chronologically with
+    rolling/EWM windows) the dropped rows are exactly the leading
+    warm-up period, but the filter itself makes no assumption about
+    row order -- it simply will never pass through a row with missing
+    required indicator data.
+
+    Raises ValueError if `df` is missing any of `required_columns`,
+    since that indicates a caller/indicator mismatch rather than a
+    normal warm-up gap.
+    """
+    missing = set(required_columns) - set(df.columns)
+
+    if missing:
+        raise ValueError(
+            f"Missing required columns: {sorted(missing)}"
+        )
+
+    valid_mask = df[list(required_columns)].notna().all(axis=1)
+
+    return df.loc[valid_mask].reset_index(drop=True)
