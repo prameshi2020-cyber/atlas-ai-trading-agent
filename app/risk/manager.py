@@ -44,22 +44,33 @@ class RiskManager:
                 "max_concurrent_positions must be at least 1"
             )
 
-        if self.config.maximum_position_pct <= 0:
-            raise ValueError(
+            if self.config.maximum_position_pct <= 0:
+               raise ValueError(
                 "maximum_position_pct must be greater than zero"
             )
 
-    def _update_day(self, timestamp: datetime) -> None:
+    def _update_day(
+        self,
+        timestamp: datetime,
+        equity: float | None = None,
+    ) -> None:
         timestamp = timestamp.astimezone(timezone.utc)
         day = timestamp.date().isoformat()
 
         if self.state.current_day is None:
             self.state.current_day = day
+
+            if equity is not None:
+                self.state.day_start_equity = equity
+
             return
 
         if day != self.state.current_day:
             self.state.current_day = day
-            self.state.day_start_equity = self.state.day_start_equity
+
+            if equity is not None:
+                self.state.day_start_equity = equity
+
             self.state.realized_daily_pnl = 0.0
 
     def update_equity(
@@ -72,7 +83,7 @@ class RiskManager:
         if not math.isfinite(equity) or equity <= 0:
             raise ValueError("equity must be greater than zero")
 
-        self._update_day(timestamp)
+        self._update_day(timestamp, equity)
 
         self.state.equity_peak = max(
             self.state.equity_peak,

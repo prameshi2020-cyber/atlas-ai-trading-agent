@@ -210,3 +210,36 @@ def test_halted_trade_returns_zero_quantity():
 
     assert decision.allowed is False
     assert decision.quantity == 0.0
+
+
+def test_new_day_resets_day_start_equity():
+    manager = RiskManager(
+        initial_equity=10_000.0,
+        config=RiskConfig(
+            daily_loss_limit_pct=0.03,
+        ),
+    )
+
+    day_one = datetime(
+        2026,
+        8,
+        25,
+        12,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+    day_two = day_one + timedelta(days=1)
+
+    manager.update_equity(
+        equity=9_500.0,
+        timestamp=day_one,
+    )
+
+    manager.update_equity(
+        equity=9_400.0,
+        timestamp=day_two,
+    )
+
+    assert manager.state.day_start_equity == pytest.approx(9_400.0)
+    assert manager.state.realized_daily_pnl == pytest.approx(0.0)
