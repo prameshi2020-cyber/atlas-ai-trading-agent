@@ -21,12 +21,21 @@ class PaperBroker:
         *,
         initial_cash: float = 10_000.0,
         fee_pct: float = 0.10,
+        fee_rate: float | None = None,
     ) -> None:
 
         if not math.isfinite(initial_cash) or initial_cash <= 0:
             raise ValueError(
                 "initial_cash must be greater than zero"
             )
+
+        if fee_rate is not None:
+            if not math.isfinite(fee_rate) or fee_rate < 0:
+                raise ValueError(
+                    "fee_rate must be non-negative"
+                )
+
+            fee_pct = fee_rate * 100
 
         if not math.isfinite(fee_pct) or fee_pct < 0:
             raise ValueError(
@@ -81,7 +90,6 @@ class PaperBroker:
         notional = order.quantity * order.price
 
         fee = notional * self.fee_pct / 100
-
         total_cost = notional + fee
 
         if order.side == "BUY":
@@ -114,3 +122,37 @@ class PaperBroker:
             timestamp=order.timestamp,
             reason="paper order executed",
         )
+
+    def execute_market_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        timestamp,
+    ) -> ExecutionResult:
+
+        order = OrderRequest(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            price=price,
+            timestamp=timestamp,
+        )
+
+        return self.execute(order)
+
+    def equity(
+        self,
+        *,
+        symbol: str,
+        market_price: float,
+    ) -> float:
+
+        if not math.isfinite(market_price) or market_price <= 0:
+            raise ValueError(
+                "market_price must be greater than zero"
+            )
+
+        return self.cash
