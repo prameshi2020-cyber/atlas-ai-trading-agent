@@ -8,7 +8,10 @@ from app.risk.manager import RiskManager
 from app.trading.broker import PaperBroker
 from app.trading.models import ExecutionResult
 from app.trading.position_manager import PositionManager
-
+from app.trading.journal import (
+    initialize_trade_journal,
+    save_trade,
+)
 
 @dataclass(slots=True)
 class TradeExecution:
@@ -27,6 +30,8 @@ class ExecutionEngine:
         self.broker = broker
         self.risk_manager = risk_manager
         self.position_manager = position_manager
+
+        initialize_trade_journal()
 
     def open_position(
         self,
@@ -147,6 +152,7 @@ class ExecutionEngine:
         symbol: str,
         exit_price: float,
         timestamp: datetime,
+        quantity: float | None = None,
     ) -> TradeExecution:
         position = self.position_manager.get_position(symbol)
 
@@ -160,6 +166,38 @@ class ExecutionEngine:
                 fee=0.0,
                 timestamp=timestamp,
                 reason="no open position",
+            )
+            return TradeExecution(result=result)
+
+        close_quantity = (
+            position.quantity
+            if quantity is None
+            else quantity
+        )
+
+        if close_quantity <= 0:
+            result = ExecutionResult(
+                success=False,
+                symbol=symbol,
+                side="SELL" if position.side == "LONG" else "BUY",
+                quantity=0.0,
+                execution_price=exit_price,
+                fee=0.0,
+                timestamp=timestamp,
+                reason="close quantity must be greater than zero",
+            )
+            return TradeExecution(result=result)
+
+        if close_quantity > position.quantity:
+            result = ExecutionResult(
+                success=False,
+                symbol=symbol,
+                side="SELL" if position.side == "LONG" else "BUY",
+                quantity=0.0,
+                execution_price=exit_price,
+                fee=0.0,
+                timestamp=timestamp,
+                reason="close quantity cannot exceed position",
             )
             return TradeExecution(result=result)
 
@@ -180,7 +218,7 @@ class ExecutionEngine:
         result = self.broker.execute_market_order(
             symbol=symbol,
             side=order_side,
-            quantity=position.quantity,
+            quantity=close_quantity,
             price=exit_price,
             timestamp=timestamp,
         )
@@ -189,15 +227,34 @@ class ExecutionEngine:
             return TradeExecution(result=result)
 
         try:
-            _, pnl = self.position_manager.close_position(
+            closed_position, pnl = self.position_manager.close_position(
                 result=result,
             )
 
-            self.risk_manager.register_position_close()
+            if close_quantity == position.quantity:
+                self.risk_manager.register_position_close()
 
             self.risk_manager.record_realized_pnl(
                 pnl=pnl,
                 timestamp=timestamp,
+            )
+
+            save_trade(
+                symbol=original_position.symbol,
+                side=original_position.side,
+                quantity=result.quantity,
+                entry_price=original_position.entry_price,
+                exit_price=result.execution_price,
+                entry_time=original_position.entry_time,
+                exit_time=result.timestamp,
+                pnl=pnl,
+                fee=(
+                    original_position.entry_fee
+                    * result.quantity
+                    / original_position.quantity
+                    + result.fee
+                ),
+                status="CLOSED",
             )
         except Exception:
             try:
