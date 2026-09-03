@@ -905,16 +905,14 @@ class BacktestEngine:
             if equity > peak:
                 peak = equity
 
-            drawdown = (
-                (equity - peak)
-                / peak
-                * 100
-            )
+            # positive magnitude: percentage distance from the most
+            # recently observed peak down to the current equity. This
+            # yields 0.0 for no drawdown and a positive value for a
+            # real drawdown (e.g., 10.0 for a 10% drop).
+            drawdown = ((peak - equity) / peak) * 100
 
-            max_drawdown = min(
-                max_drawdown,
-                drawdown,
-            )
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
 
         # -----------------------------------------------------
         # Return
