@@ -153,6 +153,7 @@ def get_trade(
             """
             SELECT
                 id,
+                trade_id,
                 symbol,
                 side,
                 quantity,
@@ -177,6 +178,43 @@ def get_trade(
 
     finally:
         connection.close()
+
+
+def load_all_trades() -> list[dict]:
+    """
+    Return all persisted journal rows in insertion order.
+    Uses the existing SQLite journal table rather than introducing a
+    separate database access layer.
+    """
+    connection = get_connection()
+
+    try:
+        rows = connection.execute(
+            """
+            SELECT
+                id,
+                trade_id,
+                symbol,
+                side,
+                quantity,
+                entry_price,
+                exit_price,
+                entry_time,
+                exit_time,
+                pnl,
+                fee,
+                status,
+                exit_reason
+            FROM trade_journal
+            ORDER BY id ASC
+            """
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    finally:
+        connection.close()
+
 
 def get_trades_by_trade_id(
     trade_id: str,
