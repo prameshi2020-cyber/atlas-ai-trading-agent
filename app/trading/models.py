@@ -25,6 +25,8 @@ class Position:
     quantity: float
     entry_price: float
     entry_time: datetime
+    entry_fee: float = 0.0
+    stop_price: float | None = None
 
 
 @dataclass(slots=True)

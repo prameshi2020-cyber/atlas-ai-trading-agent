@@ -14,7 +14,7 @@ from unittest import mock
 
 import asyncio
 
-import httpx
+import httpx  # type: ignore
 
 from app.market.binance import BinanceProvider
 

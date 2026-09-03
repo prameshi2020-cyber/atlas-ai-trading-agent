@@ -1,5 +1,9 @@
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Optional
 
+from app.market.models import Candle
+from app.strategy.stop_policy import StopPolicy
 from app.database.connection import get_connection
 from app.trading.journal import initialize_trade_journal
 from app.risk.manager import RiskManager
@@ -8,6 +12,17 @@ from app.trading.broker import PaperBroker
 from app.trading.execution import ExecutionEngine
 from app.trading.position_manager import PositionManager
 from app.trading.runner import PaperTradingRunner
+
+try:
+    from app.strategy.signal import TradingSignal  # type: ignore[reportMissingImports]
+except ImportError:
+    @dataclass
+    class TradingSignal:
+        symbol: str
+        side: str
+        price: float
+        timestamp: datetime
+        atr: Optional[float] = None
 
 
 TIMESTAMP = datetime.now(timezone.utc)
@@ -42,6 +57,9 @@ def make_runner() -> PaperTradingRunner:
     initialize_trade_journal()
     return PaperTradingRunner(
         execution_engine=engine,
+        stop_policy=StopPolicy(
+            atr_multiplier=1.5,
+        ),
     )
 
 
@@ -204,3 +222,382 @@ def test_runner_persists_closed_trade():
 
     finally:
         connection.close()
+
+def test_long_stop_closes_existing_position_on_candle_trigger():
+    runner = make_runner()
+
+    timestamp = datetime(2026, 1, 1, 12, 0, 0)
+
+    opened = runner.open(
+        symbol="BTCUSDT",
+        side="LONG",
+        entry_price=100.0,
+        stop_price=95.0,
+        timestamp=timestamp,
+    )
+
+    assert opened.execution is not None
+    assert opened.execution.result.success
+
+    class FlatStrategy:
+        def generate_signal(self, *, symbol, candles):
+            return TradingSignal(
+                symbol=symbol,
+                side="FLAT",
+                price=100.0,
+                timestamp=timestamp,
+                atr=None,
+            )
+
+    result = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[
+            {
+                "open": 100.0,
+                "high": 101.0,
+                "low": 94.0,
+                "close": 100.0,
+                "timestamp": timestamp,
+            }
+        ],
+        strategy=FlatStrategy(),
+        timestamp=timestamp,
+    )
+
+    assert result.action == "CLOSE"
+    assert result.execution is not None
+    assert result.execution.result.success
+    assert result.reason == "stop loss"
+
+
+def test_short_stop_closes_existing_position_on_candle_trigger():
+    runner = make_runner()
+
+    timestamp = datetime(2026, 1, 1, 12, 0, 0)
+
+    opened = runner.open(
+        symbol="BTCUSDT",
+        side="SHORT",
+        entry_price=100.0,
+        stop_price=105.0,
+        timestamp=timestamp,
+    )
+
+    assert opened.execution is not None
+    assert opened.execution.result.success
+
+    class FlatStrategy:
+        def generate_signal(self, *, symbol, candles):
+            return TradingSignal(
+                symbol=symbol,
+                side="FLAT",
+                price=100.0,
+                timestamp=timestamp,
+                atr=None,
+            )
+
+    result = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[
+            {
+                "open": 100.0,
+                "high": 106.0,
+                "low": 99.0,
+                "close": 100.0,
+                "timestamp": timestamp,
+            }
+        ],
+        strategy=FlatStrategy(),
+        timestamp=timestamp,
+    )
+
+    assert result.action == "CLOSE"
+    assert result.execution is not None
+    assert result.execution.result.success
+    assert result.reason == "stop loss"
+
+def test_stop_does_not_close_position_when_candle_does_not_trigger():
+    runner = make_runner()
+
+    timestamp = datetime(2026, 1, 1, 12, 0, 0)
+
+    opened = runner.open(
+        symbol="BTCUSDT",
+        side="LONG",
+        entry_price=100.0,
+        stop_price=95.0,
+        timestamp=timestamp,
+    )
+
+    assert opened.execution is not None
+    assert opened.execution.result.success
+
+    class FlatStrategy:
+        def generate_signal(self, *, symbol, candles):
+            return TradingSignal(
+                symbol=symbol,
+                side="FLAT",
+                price=100.0,
+                timestamp=timestamp,
+                atr=None,
+            )
+
+    result = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[
+            {
+                "open": 100.0,
+                "high": 101.0,
+                "low": 96.0,
+                "close": 100.0,
+                "timestamp": timestamp,
+            }
+        ],
+        strategy=FlatStrategy(),
+        timestamp=timestamp,
+    )
+
+    assert result.action == "HOLD"
+    assert result.execution is None
+    assert result.reason == "strategy returned FLAT"
+
+def test_stop_loss_closes_position_at_stop_price_and_persists_reason():
+    runner = make_runner()
+
+    timestamp = datetime(2026, 1, 1, 12, 0, 0)
+
+    opened = runner.open(
+        symbol="BTCUSDT",
+        side="LONG",
+        entry_price=100.0,
+        stop_price=95.0,
+        timestamp=timestamp,
+    )
+
+    assert opened.execution is not None
+    assert opened.execution.result.success
+
+    class FlatStrategy:
+        def generate_signal(self, *, symbol, candles):
+            return TradingSignal(
+                symbol=symbol,
+                side="FLAT",
+                price=100.0,
+                timestamp=timestamp,
+                atr=None,
+            )
+
+    result = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[
+            {
+                "open": 100.0,
+                "high": 101.0,
+                "low": 94.0,
+                "close": 100.0,
+                "timestamp": timestamp,
+            }
+        ],
+        strategy=FlatStrategy(),
+        timestamp=timestamp,
+    )
+
+    assert result.action == "CLOSE"
+    assert result.execution is not None
+    assert result.execution.result.success
+    assert result.reason == "stop loss"
+
+    assert (
+        runner.execution_engine.position_manager.get_position(
+            "BTCUSDT"
+        )
+        is None
+    )
+
+    assert result.execution.result.execution_price == 95.0
+
+    connection = get_connection()
+
+    try:
+        row = connection.execute(
+            """
+            SELECT
+                symbol,
+                exit_price,
+                status,
+                exit_reason
+            FROM trade_journal
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+        assert row is not None
+        assert row["symbol"] == "BTCUSDT"
+        assert row["exit_price"] == 95.0
+        assert row["status"] == "CLOSED"
+        assert row["exit_reason"] == "stop loss"
+
+    finally:
+        connection.close()
+
+def test_long_stop_gap_uses_candle_open_price():
+    runner = make_runner()
+
+    timestamp = datetime(2026, 1, 1, 12, 0, 0)
+
+    opened = runner.open(
+        symbol="BTCUSDT",
+        side="LONG",
+        entry_price=100.0,
+        stop_price=95.0,
+        timestamp=timestamp,
+    )
+
+    assert opened.execution is not None
+    assert opened.execution.result.success
+
+    class FlatStrategy:
+        def generate_signal(self, *, symbol, candles):
+            return TradingSignal(
+                symbol=symbol,
+                side="FLAT",
+                price=90.0,
+                timestamp=timestamp,
+                atr=None,
+            )
+
+    result = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[
+            {
+                "open": 90.0,
+                "high": 93.0,
+                "low": 88.0,
+                "close": 91.0,
+                "timestamp": timestamp,
+            }
+        ],
+        strategy=FlatStrategy(),
+        timestamp=timestamp,
+    )
+
+    assert result.action == "CLOSE"
+    assert result.execution is not None
+    assert result.execution.result.success
+    assert result.reason == "stop loss"
+
+    assert result.execution.result.execution_price == 90.0
+
+    assert (
+        runner.execution_engine.position_manager.get_position(
+            "BTCUSDT"
+        )
+        is None
+    )
+
+def test_short_stop_gap_uses_candle_open_price():
+    runner = make_runner()
+
+    timestamp = datetime(2026, 1, 1, 12, 0, 0)
+
+    opened = runner.open(
+        symbol="BTCUSDT",
+        side="SHORT",
+        entry_price=100.0,
+        stop_price=105.0,
+        timestamp=timestamp,
+    )
+
+    assert opened.execution is not None
+    assert opened.execution.result.success
+
+    class FlatStrategy:
+        def generate_signal(self, *, symbol, candles):
+            return TradingSignal(
+                symbol=symbol,
+                side="FLAT",
+                price=110.0,
+                timestamp=timestamp,
+                atr=None,
+            )
+
+    result = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[
+            {
+                "open": 110.0,
+                "high": 115.0,
+                "low": 108.0,
+                "close": 111.0,
+                "timestamp": timestamp,
+            }
+        ],
+        strategy=FlatStrategy(),
+        timestamp=timestamp,
+    )
+
+    assert result.action == "CLOSE"
+    assert result.execution is not None
+    assert result.execution.result.success
+    assert result.reason == "stop loss"
+
+    assert result.execution.result.execution_price == 110.0
+
+    assert (
+        runner.execution_engine.position_manager.get_position(
+            "BTCUSDT"
+        )
+        is None
+    )
+
+def test_runner_process_candles_accepts_candle_objects():
+    runner = make_runner()
+
+    timestamp = datetime(2026, 1, 1, 12, 0, 0)
+
+    class LongStrategy:
+        def generate_signal(self, *, symbol, candles):
+            assert all(isinstance(candle, Candle) for candle in candles)
+
+            return TradingSignal(
+                symbol=symbol,
+                side="LONG",
+                price=candles[-1].close,
+                timestamp=timestamp,
+                atr=2.0,
+            )
+
+    candles = [
+        Candle(
+            symbol="BTCUSDT",
+            timeframe="1m",
+            open=100.0,
+            high=102.0,
+            low=99.0,
+            close=101.0,
+            volume=1000.0,
+            timestamp=timestamp,
+        ),
+        Candle(
+            symbol="BTCUSDT",
+            timeframe="1m",
+            open=101.0,
+            high=104.0,
+            low=100.0,
+            close=103.0,
+            volume=1100.0,
+            timestamp=timestamp,
+        ),
+    ]
+
+    result = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=candles,
+        strategy=LongStrategy(),
+        timestamp=timestamp,
+    )
+
+    assert result.action == "OPEN"
+    assert result.execution is not None
+    assert result.execution.result.success

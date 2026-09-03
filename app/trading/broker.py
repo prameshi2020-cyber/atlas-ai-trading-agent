@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import math
 
+from app.database.models import (
+    initialize_paper_broker_database,
+    load_paper_broker_state,
+    save_paper_broker_state,
+)
 from app.trading.models import (
     ExecutionResult,
     OrderRequest,
@@ -45,6 +50,8 @@ class PaperBroker:
         self.cash = initial_cash
         self.initial_cash = initial_cash
         self.fee_pct = fee_pct
+        self.positions: dict[str, float] = {}
+        initialize_paper_broker_database()
 
     def execute(
         self,
@@ -107,11 +114,21 @@ class PaperBroker:
                 )
 
             self.cash -= total_cost
+            self.positions[order.symbol] = (
+                self.positions.get(order.symbol, 0.0)
+                + order.quantity
+            )
 
         else:
 
             self.cash += notional - fee
 
+            self.positions[order.symbol] = (
+                self.positions.get(order.symbol, 0.0)
+                - order.quantity
+            )
+
+        self.save_state()
         return ExecutionResult(
             success=True,
             symbol=order.symbol,
@@ -143,6 +160,67 @@ class PaperBroker:
 
         return self.execute(order)
 
+    def reverse_execution(
+        self,
+        result: ExecutionResult,
+    ) -> None:
+        if not result.success:
+            raise ValueError(
+                "cannot reverse failed execution"
+            )
+
+        if result.quantity <= 0:
+            raise ValueError(
+                "execution quantity must be greater than zero"
+            )
+
+        if result.execution_price <= 0:
+            raise ValueError(
+                "execution price must be greater than zero"
+            )
+
+        notional = (
+            result.quantity * result.execution_price
+        )
+
+        if result.side == "BUY":
+            self.cash += notional + result.fee
+
+            current_quantity = self.positions.get(
+                result.symbol,
+                0.0,
+            )
+
+            new_quantity = (
+                current_quantity - result.quantity
+            )
+
+        else:
+            self.cash -= notional - result.fee
+
+            current_quantity = self.positions.get(
+                result.symbol,
+                0.0,
+            )
+
+            new_quantity = (
+                current_quantity + result.quantity
+            )
+
+        if math.isclose(
+            new_quantity,
+            0.0,
+            abs_tol=1e-12,
+        ):
+            self.positions.pop(
+                result.symbol,
+                None,
+            )
+        else:
+            self.positions[result.symbol] = new_quantity
+
+        self.save_state()
+
     def equity(
         self,
         *,
@@ -155,4 +233,83 @@ class PaperBroker:
                 "market_price must be greater than zero"
             )
 
-        return self.cash
+        position_quantity = self.positions.get(symbol, 0.0)
+        position_value = position_quantity * market_price
+
+        return self.cash + position_value
+
+    def save_state(self) -> None:
+        persisted_positions = {
+            symbol: quantity
+            for symbol, quantity in self.positions.items()
+            if not math.isclose(
+                quantity,
+                0.0,
+                abs_tol=1e-12,
+            )
+        }
+
+        save_paper_broker_state(
+            cash=self.cash,
+            positions=persisted_positions,
+        )
+
+    def load_state(self) -> bool:
+        state = load_paper_broker_state()
+
+        if state is None:
+            return False
+
+        cash, positions = state
+
+        if not math.isfinite(cash) or cash <= 0:
+            raise ValueError(
+                "persisted broker cash must be greater than zero"
+            )
+
+        for symbol, quantity in positions.items():
+            if not math.isfinite(quantity):
+                raise ValueError(
+                    f"persisted broker quantity must be finite: {symbol}"
+                )
+
+            if math.isclose(quantity, 0.0, abs_tol=1e-12):
+                raise ValueError(
+                    f"persisted broker quantity cannot be zero: {symbol}"
+                )
+
+        self.cash = cash
+        self.positions = positions
+
+        return True
+
+    def restore_state(
+        self,
+        *,
+        cash: float,
+        positions: dict[str, float],
+    ) -> None:
+        if not math.isfinite(cash) or cash <= 0:
+            raise ValueError(
+                "restored broker cash must be greater than zero"
+            )
+
+        for symbol, quantity in positions.items():
+            if not math.isfinite(quantity):
+                raise ValueError(
+                    f"restored broker quantity must be finite: {symbol}"
+                )
+
+            if math.isclose(
+                quantity,
+                0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(
+                    f"restored broker quantity cannot be zero: {symbol}"
+                )
+
+        self.cash = cash
+        self.positions = positions.copy()
+
+        self.save_state()

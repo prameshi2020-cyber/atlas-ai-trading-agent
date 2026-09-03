@@ -243,3 +243,64 @@ def test_new_day_resets_day_start_equity():
 
     assert manager.state.day_start_equity == pytest.approx(9_400.0)
     assert manager.state.realized_daily_pnl == pytest.approx(0.0)
+
+
+def test_invalid_maximum_position_pct_is_rejected():
+    manager = RiskManager(
+        initial_equity=10_000.0,
+        config=RiskConfig(
+            maximum_position_pct=0.0,
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="maximum_position_pct",
+    ):
+        manager.evaluate_trade(
+            equity=10_000.0,
+            entry_price=100.0,
+            stop_price=99.0,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+def test_restore_open_positions_updates_concurrent_position_count():
+    manager = RiskManager(
+        initial_equity=10_000.0,
+        config=RiskConfig(
+            max_concurrent_positions=3,
+        ),
+    )
+
+    manager.restore_open_positions(2)
+
+    assert manager.state.concurrent_positions == 2
+
+def test_restore_open_positions_rejects_negative_count():
+    manager = RiskManager(
+        initial_equity=10_000.0,
+        config=RiskConfig(
+            max_concurrent_positions=3,
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="count must be greater than or equal to zero",
+    ):
+        manager.restore_open_positions(-1)
+
+
+def test_restore_open_positions_rejects_count_above_maximum():
+    manager = RiskManager(
+        initial_equity=10_000.0,
+        config=RiskConfig(
+            max_concurrent_positions=3,
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="restored open positions exceed",
+    ):
+        manager.restore_open_positions(4)
