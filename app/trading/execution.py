@@ -158,6 +158,7 @@ class ExecutionEngine:
         exit_price: float,
         timestamp: datetime,
         quantity: float | None = None,
+        exit_reason: str | None = None,
     ) -> TradeExecution:
         position = self.position_manager.get_position(symbol)
 
@@ -261,6 +262,7 @@ class ExecutionEngine:
                     + result.fee
                 ),
                 status="CLOSED",
+                exit_reason=exit_reason,
             )
         except Exception:
             try:

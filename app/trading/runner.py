@@ -6,7 +6,6 @@ from datetime import datetime
 from app.strategy.stop_policy import StopPolicy
 from app.market.models import Candle
 from app.trading.execution import ExecutionEngine, TradeExecution
-from app.trading.journal import save_trade
 
 
 @dataclass(slots=True)
@@ -86,6 +85,7 @@ class PaperTradingRunner:
             symbol=symbol,
             exit_price=exit_price,
             timestamp=timestamp,
+            exit_reason=exit_reason,
         )
 
         if not execution.result.success:
@@ -99,20 +99,6 @@ class PaperTradingRunner:
             raise RuntimeError(
                 "successful close execution must have PnL"
             )
-
-        save_trade(
-            symbol=position.symbol,
-            side=position.side,
-            quantity=execution.result.quantity,
-            entry_price=position.entry_price,
-            exit_price=execution.result.execution_price,
-            entry_time=position.entry_time,
-            exit_time=execution.result.timestamp,
-            pnl=execution.pnl,
-            fee=execution.result.fee,
-            status="CLOSED",
-            exit_reason=exit_reason,
-        )
 
         return RunnerResult(
             action="CLOSE",
