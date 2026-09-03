@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 
+from uuid import uuid4
+
 from app.database.models import (
     delete_position,
     load_positions,
@@ -57,7 +59,10 @@ class PositionManager:
         *,
         result: ExecutionResult,
         stop_price: float | None = None,
+        trade_id: str | None = None,
     ) -> Position:
+        if trade_id is None:
+            trade_id = uuid4().hex
         if not result.success:
             raise ValueError("cannot open position from failed execution")
 
@@ -85,8 +90,8 @@ class PositionManager:
             entry_time=result.timestamp,
             entry_fee=result.fee,
             stop_price=stop_price,
+            trade_id=trade_id,
         )
-
         self._positions[result.symbol] = position
 
         try:
@@ -142,6 +147,7 @@ class PositionManager:
                 "position entry fee does not match execution"
             )
 
+        delete_position(result.symbol)
         del self._positions[result.symbol]
 
     def close_position(
@@ -220,6 +226,7 @@ class PositionManager:
                 entry_time=position.entry_time,
                 entry_fee=remaining_entry_fee,
                 stop_price=position.stop_price,
+                trade_id=position.trade_id,
             )
 
             save_position(updated_position)

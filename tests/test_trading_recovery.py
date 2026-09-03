@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-
+from app.trading.journal import get_trades_by_trade_id
 from app.trading.journal import initialize_trade_journal
 from app.risk.manager import RiskManager
 from app.risk.models import RiskConfig
@@ -1062,3 +1062,143 @@ def test_execution_engine_partial_close_updates_all_state():
     assert row["pnl"] == pytest.approx(97.9)
     assert row["fee"] == pytest.approx(2.1)
     assert row["status"] == "CLOSED"
+
+def test_open_position_gets_stable_trade_id():
+    engine = make_engine()
+
+    opening = engine.open_position(
+        symbol="BTCUSDT",
+        side="LONG",
+        entry_price=100.0,
+        stop_price=95.0,
+        timestamp=TIMESTAMP,
+    )
+
+    assert opening.result.success
+    assert opening.trade_id is not None
+    assert len(opening.trade_id) == 32
+
+    position = engine.position_manager.get_position(
+        "BTCUSDT"
+    )
+
+    assert position is not None
+    assert position.trade_id == opening.trade_id
+
+def test_trade_id_survives_restart():
+    engine = make_engine()
+
+    opening = engine.open_position(
+        symbol="BTCUSDT",
+        side="LONG",
+        entry_price=100.0,
+        stop_price=95.0,
+        timestamp=TIMESTAMP,
+    )
+
+    assert opening.result.success
+    assert opening.trade_id is not None
+
+    restarted_engine = make_engine()
+
+    position = restarted_engine.position_manager.get_position(
+        "BTCUSDT"
+    )
+
+    assert position is not None
+    assert position.trade_id == opening.trade_id
+
+def test_partial_closes_share_same_trade_id():
+    engine = make_engine()
+
+    opening = engine.open_position(
+        symbol="BTCUSDT",
+        side="LONG",
+        entry_price=100.0,
+        stop_price=95.0,
+        timestamp=TIMESTAMP,
+    )
+
+    assert opening.result.success
+    assert opening.trade_id is not None
+
+    first_close = engine.close_position(
+        symbol="BTCUSDT",
+        quantity=10.0,
+        exit_price=110.0,
+        timestamp=TIMESTAMP,
+    )
+
+    assert first_close.result.success
+    assert first_close.trade_id == opening.trade_id
+
+    remaining = engine.position_manager.get_position(
+        "BTCUSDT"
+    )
+
+    assert remaining is not None
+    assert remaining.trade_id == opening.trade_id
+
+    second_close = engine.close_position(
+        symbol="BTCUSDT",
+        quantity=10.0,
+        exit_price=115.0,
+        timestamp=TIMESTAMP,
+    )
+
+    assert second_close.result.success
+    assert second_close.trade_id == opening.trade_id
+
+    journal_rows = get_trades_by_trade_id(
+        opening.trade_id
+    )
+
+    assert len(journal_rows) == 2
+
+    assert all(
+        row["trade_id"] == opening.trade_id
+        for row in journal_rows
+    )
+
+    assert journal_rows[0]["quantity"] == pytest.approx(10.0)
+    assert journal_rows[1]["quantity"] == pytest.approx(10.0)
+
+def test_trade_id_and_journal_lifecycle_survive_restart():
+    engine = make_engine()
+
+    opening = engine.open_position(
+        symbol="BTCUSDT",
+        side="LONG",
+        entry_price=100.0,
+        stop_price=95.0,
+        timestamp=TIMESTAMP,
+    )
+
+    assert opening.result.success
+    assert opening.trade_id is not None
+
+    closing = engine.close_position(
+        symbol="BTCUSDT",
+        quantity=10.0,
+        exit_price=110.0,
+        timestamp=TIMESTAMP,
+    )
+
+    assert closing.result.success
+
+    restarted_engine = make_engine()
+
+    position = restarted_engine.position_manager.get_position(
+        "BTCUSDT"
+    )
+
+    assert position is not None
+    assert position.trade_id == opening.trade_id
+
+    rows = get_trades_by_trade_id(
+        opening.trade_id
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["trade_id"] == opening.trade_id
+    assert rows[0]["quantity"] == pytest.approx(10.0)

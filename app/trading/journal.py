@@ -17,6 +17,7 @@ def initialize_trade_journal() -> None:
             """
             CREATE TABLE IF NOT EXISTS trade_journal (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id TEXT,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
                 quantity REAL NOT NULL,
@@ -29,6 +30,31 @@ def initialize_trade_journal() -> None:
                 status TEXT NOT NULL,
                 exit_reason TEXT
             )
+            """
+        )
+
+        columns = connection.execute(
+            "PRAGMA table_info(trade_journal)"
+        ).fetchall()
+
+        column_names = {
+            column["name"]
+            for column in columns
+        }
+
+        if "trade_id" not in column_names:
+            connection.execute(
+                """
+                ALTER TABLE trade_journal
+                ADD COLUMN trade_id TEXT
+                """
+            )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_trade_journal_trade_id
+            ON trade_journal(trade_id)
             """
         )
 
@@ -57,6 +83,7 @@ def save_trade(
     exit_time: datetime,
     pnl: float,
     fee: float,
+    trade_id: str | None = None,
     status: str = "CLOSED",
     exit_reason: str | None = None,
 ) -> int:
@@ -73,6 +100,7 @@ def save_trade(
         cursor = connection.execute(
             """
             INSERT INTO trade_journal (
+                trade_id,
                 symbol,
                 side,
                 quantity,
@@ -85,9 +113,10 @@ def save_trade(
                 status,
                 exit_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                trade_id,
                 symbol,
                 side,
                 quantity,
@@ -99,7 +128,7 @@ def save_trade(
                 fee,
                 status,
                 exit_reason,
-            ),
+            )
         )
 
         connection.commit()
@@ -145,6 +174,40 @@ def get_trade(
             return None
 
         return dict(row)
+
+    finally:
+        connection.close()
+
+def get_trades_by_trade_id(
+    trade_id: str,
+) -> list[dict]:
+    connection = get_connection()
+
+    try:
+        rows = connection.execute(
+            """
+            SELECT
+                id,
+                trade_id,
+                symbol,
+                side,
+                quantity,
+                entry_price,
+                exit_price,
+                entry_time,
+                exit_time,
+                pnl,
+                fee,
+                status,
+                exit_reason
+            FROM trade_journal
+            WHERE trade_id = ?
+            ORDER BY id ASC
+            """,
+            (trade_id,),
+        ).fetchall()
+
+        return [dict(row) for row in rows]
 
     finally:
         connection.close()

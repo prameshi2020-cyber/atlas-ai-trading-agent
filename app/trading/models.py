@@ -27,6 +27,7 @@ class Position:
     entry_time: datetime
     entry_fee: float = 0.0
     stop_price: float | None = None
+    trade_id: str | None = None
 
 
 @dataclass(slots=True)

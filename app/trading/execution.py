@@ -17,6 +17,7 @@ from app.trading.journal import (
 class TradeExecution:
     result: ExecutionResult
     pnl: float | None = None
+    trade_id: str | None = None
 
 
 class ExecutionEngine:
@@ -43,6 +44,7 @@ class ExecutionEngine:
         timestamp: datetime,
     ) -> TradeExecution:
         if self.position_manager.has_position(symbol):
+            original_position = self.position_manager.get_position(symbol)
             result = ExecutionResult(
                 success=False,
                 symbol=symbol,
@@ -54,7 +56,7 @@ class ExecutionEngine:
                 reason="position already exists",
             )
 
-            return TradeExecution(result=result)
+            return TradeExecution(result=result, trade_id=(original_position.trade_id if original_position is not None else None))
 
         equity = self.broker.equity(
             symbol=symbol,
@@ -96,7 +98,7 @@ class ExecutionEngine:
             return TradeExecution(result=result)
 
         try:
-            self.position_manager.open_position(
+            opened_position = self.position_manager.open_position(
                 result=result,
                 stop_price=stop_price,
             )
@@ -144,7 +146,10 @@ class ExecutionEngine:
                 )
             )
 
-        return TradeExecution(result=result)
+        return TradeExecution(
+            result=result,
+            trade_id=opened_position.trade_id,
+        )
 
     def close_position(
         self,
@@ -240,6 +245,7 @@ class ExecutionEngine:
             )
 
             save_trade(
+                trade_id=original_position.trade_id,
                 symbol=original_position.symbol,
                 side=original_position.side,
                 quantity=result.quantity,
@@ -275,4 +281,5 @@ class ExecutionEngine:
         return TradeExecution(
             result=result,
             pnl=pnl,
+            trade_id=original_position.trade_id,
         )

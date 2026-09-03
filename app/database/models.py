@@ -36,7 +36,6 @@ def initialize_database() -> None:
     finally:
         connection.close()
 
-
 def save_ticker(ticker: Ticker) -> None:
     connection = get_connection()
 
@@ -113,6 +112,7 @@ def initialize_position_database() -> None:
             """
             CREATE TABLE IF NOT EXISTS positions (
                 symbol TEXT PRIMARY KEY,
+                trade_id TEXT,
                 side TEXT NOT NULL,
                 quantity REAL NOT NULL,
                 entry_price REAL NOT NULL,
@@ -127,7 +127,10 @@ def initialize_position_database() -> None:
             "PRAGMA table_info(positions)"
         ).fetchall()
 
-        column_names = {column["name"] for column in columns}
+        column_names = {
+            column["name"]
+            for column in columns
+        }
 
         if "stop_price" not in column_names:
             connection.execute(
@@ -135,7 +138,23 @@ def initialize_position_database() -> None:
                 ALTER TABLE positions
                 ADD COLUMN stop_price REAL
                 """
-                )
+            )
+
+        if "trade_id" not in column_names:
+            connection.execute(
+                """
+                ALTER TABLE positions
+                ADD COLUMN trade_id TEXT
+                """
+            )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_positions_trade_id
+            ON positions(trade_id)
+            """
+        )
 
         connection.commit()
 
@@ -151,6 +170,7 @@ def save_position(position: Position) -> None:
             """
             INSERT INTO positions (
                 symbol,
+                trade_id,
                 side,
                 quantity,
                 entry_price,
@@ -158,8 +178,9 @@ def save_position(position: Position) -> None:
                 entry_fee,
                 stop_price
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
+                trade_id = excluded.trade_id,
                 side = excluded.side,
                 quantity = excluded.quantity,
                 entry_price = excluded.entry_price,
@@ -169,6 +190,7 @@ def save_position(position: Position) -> None:
             """,
             (
                 position.symbol,
+                position.trade_id,
                 position.side,
                 position.quantity,
                 position.entry_price,
@@ -208,6 +230,7 @@ def load_positions() -> list[Position]:
             """
             SELECT
                 symbol,
+                trade_id,
                 side,
                 quantity,
                 entry_price,
@@ -222,6 +245,7 @@ def load_positions() -> list[Position]:
         return [
             Position(
                 symbol=row["symbol"],
+                trade_id=row["trade_id"],
                 side=row["side"],
                 quantity=row["quantity"],
                 entry_price=row["entry_price"],
