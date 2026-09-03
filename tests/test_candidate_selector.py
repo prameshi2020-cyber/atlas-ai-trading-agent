@@ -399,3 +399,61 @@ def test_provider_selects_empty_candidate_id_rejected() -> None:
 
     with pytest.raises(ValueError, match="empty candidate_id"):
         selector.select(SelectionRequest(ranking_result=ranking))
+
+def test_zero_loss_candidate_with_infinite_profit_factor_is_eligible():
+    selector = CandidateSelector(provider=None)
+    perfect = CandidateFactory.build(candidate_id="perfect", name="Perfect", score=88.0, accepted=True)
+    perfect.metrics_used["profit_factor"] = float("inf")
+    other = CandidateFactory.build(candidate_id="other", name="Other", score=70.0, accepted=True)
+
+    decision = selector.select(SelectionRequest(ranking_result=RankingResult(ranked_candidates=[perfect, other])))
+
+    assert decision.selected_candidate_id == "perfect"
+    assert decision.eligible_candidate_count == 2
+
+
+def test_infinite_profit_factor_reaches_provider_unmodified():
+    provider = RecordingProvider()
+    selector = CandidateSelector(provider=provider)
+    perfect = CandidateFactory.build(candidate_id="perfect", name="Perfect", score=88.0, accepted=True)
+    perfect.metrics_used["profit_factor"] = float("inf")
+
+    selector.select(SelectionRequest(ranking_result=RankingResult(ranked_candidates=[perfect])))
+
+    offered = provider.requests[0].ranking_result.ranked_candidates[0]
+    assert offered.metrics_used["profit_factor"] == math.inf
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("-inf")])
+def test_nan_or_negative_infinite_profit_factor_is_rejected(value):
+    selector = CandidateSelector(provider=None)
+    bad = CandidateFactory.build(candidate_id="bad", name="Bad", score=80.0, accepted=True)
+    bad.metrics_used["profit_factor"] = value
+
+    with pytest.raises(ValueError, match=r"metric 'profit_factor'.*must be finite or \+inf"):
+        selector.select(SelectionRequest(ranking_result=RankingResult(ranked_candidates=[bad])))
+
+
+@pytest.mark.parametrize(
+    "metric",
+    ["total_return_pct", "max_drawdown_pct", "total_trades", "win_rate_pct", "sharpe_ratio", "sortino_ratio"],
+)
+def test_positive_infinity_remains_invalid_for_bounded_metrics(metric):
+    selector = CandidateSelector(provider=None)
+    bad = CandidateFactory.build(candidate_id="bad", name="Bad", score=80.0, accepted=True)
+    bad.metrics_used[metric] = float("inf")
+
+    with pytest.raises(ValueError, match=rf"metric '{metric}'.*must be finite$"):
+        selector.select(SelectionRequest(ranking_result=RankingResult(ranked_candidates=[bad])))
+
+
+def test_infinite_profit_factor_does_not_change_deterministic_ordering():
+    selector = CandidateSelector(provider=None)
+    perfect = CandidateFactory.build(candidate_id="b", name="B", score=60.0, accepted=True)
+    perfect.metrics_used["profit_factor"] = float("inf")
+    ordinary = CandidateFactory.build(candidate_id="a", name="A", score=60.0, accepted=True)
+
+    decision = selector.select(SelectionRequest(ranking_result=RankingResult(ranked_candidates=[perfect, ordinary])))
+
+    assert [item.candidate_id for item in decision.eligible_candidates] == ["a", "b"]
+    assert decision.selected_candidate_id == "a"

@@ -25,6 +25,15 @@ _FORBIDDEN_METADATA_KEYS = {
     "action",
 }
 
+# Metrics whose domain legitimately includes +inf.
+#
+# profit_factor = gross_profit / gross_loss. A strategy with positive gross profit and
+# no losing trades has an unbounded profit factor. BacktestEngine, StrategyEvaluator and
+# AnalyticsEngine all represent that state as float("inf") and RankingEngine clamps it
+# deterministically when scoring, so +inf is a valid value for this metric and must not
+# be treated as malformed data. NaN and -inf remain invalid for every metric, and +inf
+# remains invalid for every metric not declared here.
+UNBOUNDED_ABOVE_METRICS: frozenset[str] = frozenset({"profit_factor"})
 
 @dataclass(frozen=True, slots=True)
 class ProviderSelection:
@@ -206,6 +215,13 @@ def _is_finite_number(value: Any) -> bool:
         return math.isfinite(float(value))
     return False
 
+def _is_valid_metric_value(key: str, value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    number = float(value)
+    if math.isfinite(number):
+        return True
+    return key in UNBOUNDED_ABOVE_METRICS and number == math.inf
 
 def _validate_candidate_score(candidate: CandidateScore) -> None:
     if not isinstance(candidate, CandidateScore):
@@ -240,8 +256,9 @@ def _validate_candidate_score(candidate: CandidateScore) -> None:
                     raise ValueError(
                         f"metric {key}.{nested_key} for {candidate.candidate_id!r} must be finite"
                     )
-        elif not _is_finite_number(value):
-            raise ValueError(f"metric {key!r} for {candidate.candidate_id!r} must be finite")
+        elif not _is_valid_metric_value(key, value):
+            allowed = "finite or +inf" if key in UNBOUNDED_ABOVE_METRICS else "finite"
+            raise ValueError(f"metric {key!r} for {candidate.candidate_id!r} must be {allowed}")
 
 
 def _eligible_candidates_from_result(ranking_result: RankingResult) -> tuple[CandidateScore, ...]:

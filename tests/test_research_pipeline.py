@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 import json
+import math
 from pathlib import Path
 import re
 
@@ -488,15 +489,18 @@ def test_no_candidate_duplication_in_results_or_ranking(dataset, frame):
     assert len(result.ranked_candidate_ids) == len(set(result.ranked_candidate_ids))
 
 
-def test_candidate_with_infinite_profit_factor_is_isolated_as_selection_failure(dataset, frame):
-    # Documents current upstream behaviour: a run with no losing trades yields
-    # profit_factor=inf, which CandidateSelector rejects as non-finite.
+def test_candidate_with_infinite_profit_factor_is_selectable(dataset, frame):
     result = pipeline().run(request(dataset, cand("wins", WINS_ONLY)), frame)
 
+    item = result.result_for("wins")
+    assert item.backtest_result.losing_trades == 0
+    assert item.backtest_result.profit_factor == math.inf
+    assert item.evaluation.metrics["profit_factor"] == math.inf
     assert result.score_for("wins").accepted is True
-    assert result.selection_decision is None
-    (failure,) = result.batch_failures
-    assert failure.stage == "selection" and "finite" in failure.message
+    assert result.score_for("wins").metrics_used["profit_factor"] == math.inf
+    assert result.batch_failures == ()
+    assert result.selected_candidate_id == "wins"
+    assert result.to_dict()["results"][0]["metrics"]["profit_factor"] == "inf"
 
 
 # --- provenance / fingerprints ---------------------------------------------------

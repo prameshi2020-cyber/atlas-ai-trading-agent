@@ -6,7 +6,7 @@ import json
 import math
 from typing import Any
 
-from app.agents.candidate_selector import ProviderSelection, SelectionRequest
+from app.agents.candidate_selector import UNBOUNDED_ABOVE_METRICS, ProviderSelection, SelectionRequest
 from app.agents.llm_client import LLMClient
 from app.analysis.ranking import CandidateScore
 from app.config.settings import settings
@@ -25,6 +25,10 @@ CANDIDATE_METRIC_KEYS: tuple[str, ...] = (
 )
 
 MAX_REASON_LENGTH = 500
+
+# Rendering of a metric whose value is +inf within its declared domain (see UNBOUNDED_ABOVE_METRICS).
+# JSON cannot carry infinity; an explicit marker preserves the meaning instead of dropping the field.
+UNBOUNDED_METRIC_MARKER = "unbounded"
 
 SYSTEM_PROMPT = (
     "You are a strategy-candidate selection assistant for ATLAS.\n"
@@ -74,6 +78,10 @@ def _finite_number(value: object) -> int | float | None:
     return None
 
 
+def _is_positive_infinity(value: object) -> bool:
+    return isinstance(value, float) and not isinstance(value, bool) and value == math.inf
+
+
 def build_selection_payload(candidates: Sequence[CandidateScore]) -> dict[str, Any]:
     """Build the minimal, read-only candidate context sent to the model."""
     entries: list[dict[str, Any]] = []
@@ -99,16 +107,20 @@ def build_selection_payload(candidates: Sequence[CandidateScore]) -> dict[str, A
 
         metrics = candidate.metrics_used if isinstance(candidate.metrics_used, dict) else {}
         for key in CANDIDATE_METRIC_KEYS:
-            value = _finite_number(metrics.get(key))
+            raw = metrics.get(key)
+            value = _finite_number(raw)
             if value is not None:
                 entry[key] = value
+            elif key in UNBOUNDED_ABOVE_METRICS and _is_positive_infinity(raw):
+                entry[key] = UNBOUNDED_METRIC_MARKER
 
         entries.append(entry)
 
     return {
         "task": (
             "Choose at most one candidate_id from candidate_ids, or null if none should be chosen. "
-            'Reply with a single JSON object: {"candidate_id": <string or null>, "reason": <string>}.'
+            'Reply with a single JSON object: {"candidate_id": <string or null>, "reason": <string>}. '
+            f'A profit_factor of "{UNBOUNDED_METRIC_MARKER}" means positive gross profit with no losing trades.'
         ),
         "candidate_ids": [entry["candidate_id"] for entry in entries],
         "candidates": entries,
