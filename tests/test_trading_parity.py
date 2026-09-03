@@ -14,6 +14,7 @@ from app.risk.models import RiskConfig
 from app.strategy.stop_policy import StopPolicy
 from app.trading.broker import PaperBroker
 from app.trading.execution import ExecutionEngine
+from app.trading.execution_policy import ExecutionContract
 from app.trading.position_manager import PositionManager
 from app.trading.runner import PaperTradingRunner
 
@@ -329,3 +330,138 @@ def test_runner_uses_latest_candle_close_for_entry_and_strategy_signal_contract(
 
     assert result.action in {"OPEN", "HOLD", "REJECT"}
     assert result.execution is None or result.execution.result.success
+
+
+def test_backtest_execution_contract_uses_next_candle_open():
+    rows = [
+        {
+            "timestamp": TIMESTAMP - timedelta(minutes=2),
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "volume": 1000.0,
+            "atr_14": 2.0,
+        },
+        {
+            "timestamp": TIMESTAMP - timedelta(minutes=1),
+            "open": 101.0,
+            "high": 103.0,
+            "low": 100.0,
+            "close": 102.0,
+            "volume": 1000.0,
+            "atr_14": 2.0,
+        },
+        {
+            "timestamp": TIMESTAMP,
+            "open": 103.0,
+            "high": 104.0,
+            "low": 102.0,
+            "close": 103.0,
+            "volume": 1000.0,
+            "atr_14": 2.0,
+        },
+    ]
+    features = __import__("pandas").DataFrame(rows)
+    for column in [
+        "ema_9",
+        "ema_21",
+        "macd_histogram",
+        "rsi_14",
+        "price_vs_ema21",
+        "price_vs_sma50",
+        "momentum_10",
+        "momentum_20",
+        "sma_50",
+    ]:
+        features[column] = 0.0
+
+    class AlwaysBuyStrategy:
+        def generate_signal(self, *, symbol, features):
+            return __import__("types").SimpleNamespace(
+                action="BUY",
+                symbol=symbol,
+                score=1.0,
+                confidence=1.0,
+                reasons=["manual"],
+            )
+
+    engine = __import__("app.analysis.backtest", fromlist=["BacktestEngine"]).BacktestEngine(
+        strategy=AlwaysBuyStrategy(),
+        initial_capital=10_000.0,
+        fee_pct=0.0,
+        slippage_pct=0.0,
+        stop_loss_atr=1.5,
+        take_profit_atr=3.0,
+    )
+
+    result = engine.run(symbol="BTCUSDT", features=features)
+
+    assert result.total_trades == 1
+    trade = result.trades[0]
+    assert trade.entry_price == pytest.approx(101.0)
+    assert trade.entry_time == rows[1]["timestamp"]
+    assert trade.exit_time == rows[2]["timestamp"]
+    assert trade.exit_reason in {"STOP_LOSS", "TAKE_PROFIT", "END_OF_DATA", "SIGNAL"}
+
+
+def test_paper_execution_contract_uses_observed_market_event():
+    runner = make_runner()
+
+    signal_time = TIMESTAMP
+    candle = Candle(
+        symbol="BTCUSDT",
+        timeframe="1m",
+        open=100.0,
+        high=101.0,
+        low=99.0,
+        close=100.0,
+        volume=1000.0,
+        timestamp=signal_time,
+    )
+
+    class AlwaysLongStrategy:
+        def generate_signal(self, *, symbol, candles):
+            return __import__("types").SimpleNamespace(
+                side="LONG",
+                price=100.0,
+                timestamp=signal_time,
+                atr=2.0,
+                symbol=symbol,
+                reason="manual",
+            )
+
+    result = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[candle],
+        strategy=AlwaysLongStrategy(),
+        timestamp=signal_time,
+    )
+
+    assert result.execution is not None
+    assert result.execution.result.success
+    assert result.execution.result.execution_price == pytest.approx(100.0)
+    assert result.execution.result.timestamp == signal_time
+
+
+def test_execution_contract_defines_shared_domain_rules():
+    contract = ExecutionContract(
+        decision_timestamp="decision candle close",
+        execution_timestamp="next market event or next candle open",
+        execution_price_source="environment-specific observed price",
+        entry_semantics="open on execution event; shared accounting rules",
+        exit_semantics="close on stop / take profit / reversal / manual",
+        reversal_semantics="close prior position before opening new direction",
+        fee_semantics="shared fee and slippage accounting in ExecutionEngine",
+        slippage_semantics="environment-specific plumbing, common accounting interface",
+        stop_loss_semantics="deterministic stop policy on observed price range",
+    )
+
+    assert contract.decision_timestamp == "decision candle close"
+    assert contract.execution_timestamp in {
+        "next market event or next candle open",
+        "next market event",
+    }
+    assert contract.execution_price_source == "environment-specific observed price"
+    assert contract.fee_semantics == "shared fee and slippage accounting in ExecutionEngine"
+    assert contract.stop_loss_semantics == "deterministic stop policy on observed price range"
