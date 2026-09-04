@@ -288,13 +288,23 @@ def test_unknown_strategy_is_a_validation_failure_not_an_exception(dataset, fram
     assert "unknown strategy_id" in failure.message
 
 
-def test_non_default_backtest_config_is_rejected_until_walk_forward_parity_exists(dataset, frame):
+def test_non_default_backtest_config_is_applied_to_walk_forward_windows(dataset, frame):
     result = pipeline().run(request(dataset, cand("a"), cand("cheap", backtest=BacktestConfig(fee_pct=0.0))), frame)
 
-    assert result.result_for("a") is not None
-    failure = result.failures_for("cheap")[0]
-    assert failure.stage == "validation"
-    assert "walk-forward" in failure.message
+    assert result.failures_for("cheap") == ()
+    baseline = result.result_for("a")
+    cheap = result.result_for("cheap")
+    assert baseline is not None and cheap is not None
+
+    base_wf, cheap_wf = baseline.walk_forward_result, cheap.walk_forward_result
+    assert cheap_wf.total_windows == base_wf.total_windows
+    for base_window, cheap_window in zip(base_wf.windows, cheap_wf.windows, strict=True):
+        b, c = base_window.out_of_sample_result, cheap_window.out_of_sample_result
+        assert (cheap_window.test_start, cheap_window.test_end) == (base_window.test_start, base_window.test_end)
+        assert c.total_trades == b.total_trades  # fees never change signals or exits
+        if b.total_trades:
+            assert c.total_return_pct > b.total_return_pct  # zero fee strictly improves every traded window
+    assert cheap_wf.aggregate_oos_return_pct > base_wf.aggregate_oos_return_pct
 
 
 def test_dataset_mismatch_is_rejected_before_any_evaluation(dataset, frame):

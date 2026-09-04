@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Callable, Literal
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import Any
 
 import pandas as pd
+import inspect
 
 from app.analysis.backtest import BacktestEngine, BacktestResult
 from app.analysis.evaluation import StrategyEvaluation, StrategyEvaluationPolicy, StrategyEvaluator
@@ -11,6 +15,11 @@ from app.analysis.strategy import StrategyEngine
 
 RobustnessDecision = Literal["PASS", "FAIL", "REVIEW"]
 
+# Constructor arguments BacktestEngine accepts for a window backtest. Derived from the
+# signature so WalkForwardEngine never re-declares (or drifts from) BacktestEngine's rules.
+_BACKTEST_KWARG_NAMES: frozenset[str] = frozenset(
+    name for name in inspect.signature(BacktestEngine.__init__).parameters if name not in {"self", "strategy"}
+)
 
 @dataclass(frozen=True, slots=True)
 class WalkForwardConfig:
@@ -98,9 +107,23 @@ class WalkForwardEngine:
         *,
         strategy_factory: Callable[[], object] | None = None,
         evaluator: StrategyEvaluator | None = None,
+        backtest_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         self.strategy_factory = strategy_factory or (lambda: StrategyEngine())
         self.evaluator = evaluator or StrategyEvaluator()
+        self.backtest_kwargs = self._normalize_backtest_kwargs(backtest_kwargs)
+
+    @staticmethod
+    def _normalize_backtest_kwargs(kwargs: Mapping[str, Any] | None) -> Mapping[str, Any]:
+        """Keys are checked against BacktestEngine's signature; values are validated by BacktestEngine itself."""
+        if kwargs is None:
+            return MappingProxyType({})
+        if not isinstance(kwargs, Mapping):
+            raise TypeError("backtest_kwargs must be a mapping of BacktestEngine constructor arguments")
+        unknown = sorted(str(key) for key in kwargs if key not in _BACKTEST_KWARG_NAMES)
+        if unknown:
+            raise TypeError(f"backtest_kwargs contains arguments BacktestEngine does not accept: {unknown}")
+        return MappingProxyType(dict(kwargs))
 
     def _validate_data(self, data: pd.DataFrame) -> pd.DataFrame:
         if data is None or data.empty:
@@ -163,12 +186,11 @@ class WalkForwardEngine:
         features: pd.DataFrame,
         *,
         strategy: object,
-        initial_capital: float = 10_000.0,
     ) -> BacktestResult:
         if features is None or features.empty:
             raise ValueError("cannot backtest on an empty slice")
 
-        engine = BacktestEngine(strategy=strategy, initial_capital=initial_capital)
+        engine = BacktestEngine(strategy=strategy, **self.backtest_kwargs)
         try:
             return engine.run(symbol=symbol, features=features)
         except ValueError as exc:

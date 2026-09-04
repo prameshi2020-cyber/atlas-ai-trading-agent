@@ -240,7 +240,7 @@ class DatasetDescriptor:
 
 @dataclass(frozen=True, slots=True)
 class BacktestConfig:
-    """Full-sample backtest configuration; mirrors BacktestEngine's constructor arguments."""
+    """Backtest configuration shared by the headline backtest and every walk-forward window."""
 
     initial_capital: float = 10_000.0
     fee_pct: float = 0.10
@@ -278,7 +278,7 @@ class BacktestConfig:
 # WalkForwardEngine constructs BacktestEngine with its defaults for every window and offers
 # no hook to change that. Until such a hook exists, research candidates must use the same
 # defaults so the headline backtest and the robustness check share execution assumptions.
-WALK_FORWARD_BACKTEST_CONFIG = BacktestConfig()
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -799,17 +799,6 @@ class ResearchPipeline:
                 message=f"unknown strategy_id {candidate.strategy_id!r}; known strategies: {list(self.strategy_ids)}",
             )
 
-        if candidate.backtest != WALK_FORWARD_BACKTEST_CONFIG:
-            return ResearchFailure(
-                candidate_id=candidate_id,
-                stage="validation",
-                error_type="ValueError",
-                message=(
-                    "walk-forward windows are evaluated with BacktestEngine defaults; a non-default "
-                    "backtest configuration is rejected until walk-forward backtest parity exists"
-                ),
-            )
-
         build = _strategy_builder(factory, candidate.parameters, candidate_id)
         try:
             strategy = build()
@@ -866,7 +855,11 @@ class ResearchPipeline:
             return ResearchFailure.from_exception(candidate_id, "evaluation", exc)
 
         try:
-            walk_forward_engine = WalkForwardEngine(strategy_factory=build, evaluator=self._evaluator)
+            walk_forward_engine = WalkForwardEngine(
+                strategy_factory=build,
+                evaluator=self._evaluator,
+                backtest_kwargs=candidate.backtest.engine_kwargs(),
+            )
             walk_forward_result = walk_forward_engine.run(frame, request.walk_forward_config)
         except Exception as exc:
             return ResearchFailure.from_exception(candidate_id, "walk_forward", exc)
