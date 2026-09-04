@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_ROOT = REPO_ROOT / "app"
 
 # Packages whose modules are inspected.
-GUARDED_PACKAGES: tuple[str, ...] = ("app.agents",)
+GUARDED_PACKAGES: tuple[str, ...] = ("app.agents", "app.decision")
 
 # Packages the AI layer may never import (directly or transitively by name).
 FORBIDDEN_PACKAGES: frozenset[str] = frozenset(
@@ -28,6 +28,12 @@ FORBIDDEN_PACKAGES: frozenset[str] = frozenset(
     }
 )
 
+# Cross-layer rules: the AI layer may not reach the deployment gate and the gate
+# may not reach the AI layer. Deterministic code decides; AI only advises upstream.
+CROSS_LAYER_FORBIDDEN: dict[str, frozenset[str]] = {
+    "app.agents": frozenset({"app.decision"}),
+    "app.decision": frozenset({"app.agents"}),
+}
 
 def _module_name(path: Path) -> str:
     parts = list(path.relative_to(REPO_ROOT).with_suffix("").parts)
@@ -50,8 +56,8 @@ def _resolve_relative(package: str, level: int, module: str | None) -> str:
     return base
 
 
-def _is_forbidden(name: str) -> bool:
-    return any(name == pkg or name.startswith(pkg + ".") for pkg in FORBIDDEN_PACKAGES)
+def _is_forbidden(name: str, extra: frozenset[str] = frozenset()) -> bool:
+    return any(name == pkg or name.startswith(pkg + ".") for pkg in FORBIDDEN_PACKAGES | extra)
 
 
 def _imported_names(tree: ast.AST, package: str) -> list[tuple[int, str]]:
@@ -87,14 +93,17 @@ def _guarded_files() -> list[Path]:
 
 @pytest.mark.parametrize("path", _guarded_files(), ids=lambda p: p.relative_to(REPO_ROOT).as_posix())
 def test_ai_layer_does_not_import_trading_stack(path: Path) -> None:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     module = _module_name(path)
+    guarded = next(pkg for pkg in GUARDED_PACKAGES if module == pkg or module.startswith(pkg + "."))
+    extra = CROSS_LAYER_FORBIDDEN.get(guarded, frozenset())
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     package = _package_of(module, path)
 
     violations = [
         f"{path.relative_to(REPO_ROOT).as_posix()}:{lineno} imports {name!r}"
         for lineno, name in _imported_names(tree, package)
-        if _is_forbidden(name)
+        if _is_forbidden(name, extra)
     ]
     assert not violations, "AI layer must never reach the trading stack:\n" + "\n".join(violations)
 
