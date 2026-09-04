@@ -471,7 +471,7 @@ def test_ai_cannot_bypass_deterministic_acceptance(dataset, frame):
     assert result.ranking_result is not None
     assert result.selection_decision is None
     (failure,) = result.batch_failures
-    assert failure.stage == "selection" and failure.error_type == "ValueError"
+    assert failure.stage == "selection" and failure.error_type == "ProviderViolationError"
     assert "ineligible" in failure.message
 
 

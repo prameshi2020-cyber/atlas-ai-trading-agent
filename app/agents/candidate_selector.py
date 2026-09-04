@@ -5,6 +5,7 @@ import math
 from typing import Any, Literal, Protocol
 
 from app.analysis.ranking import CandidateScore, RankingResult
+from app.agents.errors import InvalidMetricError, MalformedCandidateError, ProviderViolationError
 
 SelectionSource = Literal["provider", "fallback", "none"]
 
@@ -47,7 +48,7 @@ class ProviderSelection:
         if self.candidate_id is not None:
             candidate_id = str(self.candidate_id).strip()
             if not candidate_id:
-                raise ValueError("empty candidate_id")
+                raise ProviderViolationError("empty candidate_id", violation="empty_candidate_id")
             object.__setattr__(self, "candidate_id", candidate_id)
 
         if self.reason is not None:
@@ -59,7 +60,12 @@ class ProviderSelection:
 
         forbidden = set(self.metadata.keys()) & _FORBIDDEN_METADATA_KEYS
         if forbidden:
-            raise ValueError(f"provider metadata contains forbidden keys: {sorted(forbidden)}")
+            raise ProviderViolationError(
+                f"provider metadata contains forbidden keys: {sorted(forbidden)}",
+                violation="forbidden_metadata",
+                candidate_id=self.candidate_id,
+                forbidden_keys=tuple(sorted(forbidden)),
+            )
 
     def as_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"candidate_id": self.candidate_id, "reason": self.reason}
@@ -179,12 +185,15 @@ class CandidateSelector:
         if provider_result.candidate_id is not None:
             provider_candidate_id = str(provider_result.candidate_id).strip()
             if not provider_candidate_id:
-                raise ValueError("provider returned an empty candidate_id")
+                raise ProviderViolationError("provider returned an empty candidate_id", violation="empty_candidate_id")
             eligible_ids = {candidate.candidate_id for candidate in eligible}
             if provider_candidate_id not in eligible_ids:
-                raise ValueError(
+                raise ProviderViolationError(
                     f"provider returned ineligible candidate_id {provider_candidate_id!r}; "
-                    f"eligible set is {sorted(eligible_ids)}"
+                    f"eligible set is {sorted(eligible_ids)}",
+                    violation="ineligible_candidate",
+                    candidate_id=provider_candidate_id,
+                    eligible_ids=tuple(sorted(eligible_ids)),
                 )
             selected_score = next(score for score in eligible if score.candidate_id == provider_candidate_id)
             return SelectionDecision(
@@ -227,11 +236,17 @@ def _validate_candidate_score(candidate: CandidateScore) -> None:
     if not isinstance(candidate, CandidateScore):
         raise TypeError("candidate score entries must be CandidateScore instances")
     if not isinstance(candidate.candidate_id, str) or not candidate.candidate_id.strip():
-        raise ValueError("candidate_id must be a non-empty string")
+        raise MalformedCandidateError("candidate_id must be a non-empty string", candidate_id=None, field="candidate_id")
     if not isinstance(candidate.candidate_name, str) or not candidate.candidate_name.strip():
-        raise ValueError("candidate_name must be a non-empty string")
+        raise MalformedCandidateError(
+            "candidate_name must be a non-empty string", candidate_id=candidate.candidate_id, field="candidate_name"
+        )
     if not _is_finite_number(candidate.score):
-        raise ValueError(f"candidate score for {candidate.candidate_id!r} must be finite")
+        raise MalformedCandidateError(
+            f"candidate score for {candidate.candidate_id!r} must be finite",
+            candidate_id=candidate.candidate_id,
+            field="score",
+        )
 
     if candidate.accepted is not True:
         return
@@ -245,20 +260,42 @@ def _validate_candidate_score(candidate: CandidateScore) -> None:
         if key == "score_components":
             nested = value
             if not isinstance(nested, dict):
-                raise ValueError(f"score_components for {candidate.candidate_id!r} must be a dict")
+                raise InvalidMetricError(
+                    f"score_components for {candidate.candidate_id!r} must be a dict",
+                    candidate_id=candidate.candidate_id,
+                    metric="score_components",
+                    value=nested,
+                    allowed="dict",
+                )
             for nested_key, nested_value in nested.items():
                 if not _is_finite_number(nested_value) and not isinstance(nested_value, dict):
-                    raise ValueError(f"score component {nested_key!r} for {candidate.candidate_id!r} is not finite")
+                    raise InvalidMetricError(
+                        f"score component {nested_key!r} for {candidate.candidate_id!r} is not finite",
+                        candidate_id=candidate.candidate_id,
+                        metric=f"score_components.{nested_key}",
+                        value=nested_value,
+                        allowed="finite",
+                    )
             continue
         if isinstance(value, dict):
             for nested_key, nested_value in value.items():
                 if not _is_finite_number(nested_value):
-                    raise ValueError(
-                        f"metric {key}.{nested_key} for {candidate.candidate_id!r} must be finite"
+                    raise InvalidMetricError(
+                        f"metric {key}.{nested_key} for {candidate.candidate_id!r} must be finite",
+                        candidate_id=candidate.candidate_id,
+                        metric=f"{key}.{nested_key}",
+                        value=nested_value,
+                        allowed="finite",
                     )
         elif not _is_valid_metric_value(key, value):
             allowed = "finite or +inf" if key in UNBOUNDED_ABOVE_METRICS else "finite"
-            raise ValueError(f"metric {key!r} for {candidate.candidate_id!r} must be {allowed}")
+            raise InvalidMetricError(
+                f"metric {key!r} for {candidate.candidate_id!r} must be {allowed}",
+                candidate_id=candidate.candidate_id,
+                metric=key,
+                value=value,
+                allowed=allowed,
+            )
 
 
 def _eligible_candidates_from_result(ranking_result: RankingResult) -> tuple[CandidateScore, ...]:
@@ -268,9 +305,8 @@ def _eligible_candidates_from_result(ranking_result: RankingResult) -> tuple[Can
     for candidate in ranked:
         try:
             _validate_candidate_score(candidate)
-        except ValueError as exc:
-            message = str(exc)
-            if "candidate score for" in message and "must be finite" in message:
+        except MalformedCandidateError as exc:
+            if exc.field == "score":
                 continue
             raise
 
