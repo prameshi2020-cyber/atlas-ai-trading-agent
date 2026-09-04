@@ -524,6 +524,44 @@ def initialize_risk_state_database() -> None:
         connection.close()
 
 
+def initialize_pending_intents_database() -> None:
+    """
+    Create the pending_intents table for persisted ExecutionIntent rows.
+    """
+    connection = get_connection()
+
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_intents (
+                intent_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                decision_timestamp TEXT NOT NULL,
+                source_candle_timestamp TEXT NOT NULL,
+                status TEXT NOT NULL,
+                atr REAL,
+                created_at TEXT NOT NULL,
+                executed_at TEXT,
+                trade_id TEXT,
+                reason TEXT
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_pending_intents_symbol
+            ON pending_intents(symbol)
+            """
+        )
+
+        connection.commit()
+
+    finally:
+        connection.close()
+
+
 def save_risk_state(
     *,
     equity_peak: float,
@@ -607,6 +645,129 @@ def load_risk_state() -> dict | None:
             "halted": bool(row["halted"]),
             "halt_reason": row["halt_reason"],
         }
+
+    finally:
+        connection.close()
+
+
+def save_intent(
+    *,
+    intent_id: str,
+    symbol: str,
+    side: str,
+    decision_timestamp: str,
+    source_candle_timestamp: str,
+    status: str,
+    atr: float | None,
+    created_at: str,
+    executed_at: str | None = None,
+    trade_id: str | None = None,
+    reason: str | None = None,
+) -> None:
+    """Persist an execution intent row.
+
+    Raises ValueError on duplicate intent_id or invalid data.
+    """
+    connection = get_connection()
+
+    try:
+        connection.execute(
+            """
+            INSERT INTO pending_intents (
+                intent_id,
+                symbol,
+                side,
+                decision_timestamp,
+                source_candle_timestamp,
+                status,
+                atr,
+                created_at,
+                executed_at,
+                trade_id,
+                reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                intent_id,
+                symbol,
+                side,
+                decision_timestamp,
+                source_candle_timestamp,
+                status,
+                atr,
+                created_at,
+                executed_at,
+                trade_id,
+                reason,
+            ),
+        )
+
+        connection.commit()
+
+    except Exception:
+        # Bubble up a clear error for duplicates or other DB issues
+        raise
+
+    finally:
+        connection.close()
+
+
+def load_pending_intents(status: str | None = None) -> list[dict]:
+    """Load persisted intent rows. If `status` is provided, filter by it."""
+    connection = get_connection()
+
+    try:
+        if status is None:
+            rows = connection.execute(
+                "SELECT * FROM pending_intents ORDER BY created_at ASC"
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT * FROM pending_intents WHERE status = ? ORDER BY created_at ASC",
+                (status,),
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    finally:
+        connection.close()
+
+
+def update_intent_status(
+    *,
+    intent_id: str,
+    status: str,
+    executed_at: str | None = None,
+    trade_id: str | None = None,
+) -> None:
+    connection = get_connection()
+
+    try:
+        connection.execute(
+            """
+            UPDATE pending_intents
+            SET status = ?, executed_at = ?, trade_id = ?
+            WHERE intent_id = ?
+            """,
+            (status, executed_at, trade_id, intent_id),
+        )
+
+        connection.commit()
+
+    finally:
+        connection.close()
+
+
+def delete_intent(intent_id: str) -> None:
+    connection = get_connection()
+
+    try:
+        connection.execute(
+            "DELETE FROM pending_intents WHERE intent_id = ?",
+            (intent_id,),
+        )
+
+        connection.commit()
 
     finally:
         connection.close()

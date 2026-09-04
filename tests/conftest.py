@@ -9,6 +9,7 @@ from app.database.models import (
     initialize_position_database,
 )
 from app.trading.journal import initialize_trade_journal
+from app.database.models import initialize_pending_intents_database
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +74,7 @@ def isolated_database(tmp_path, monkeypatch):
     initialize_database()
     initialize_candle_database()
     initialize_position_database()
+    initialize_pending_intents_database()
     initialize_trade_journal()
 
     yield database_path
