@@ -12,6 +12,7 @@ from app.trading.broker import PaperBroker
 from app.trading.execution import ExecutionEngine
 from app.trading.position_manager import PositionManager
 from app.trading.runner import PaperTradingRunner
+from app.trading import intent_manager
 
 try:
     from app.strategy.signal import TradingSignal  # type: ignore[reportMissingImports]
@@ -28,7 +29,7 @@ except ImportError:
 TIMESTAMP = datetime.now(timezone.utc)
 
 
-def make_runner() -> PaperTradingRunner:
+def make_runner(defer_execution: bool = False) -> PaperTradingRunner:
     broker = PaperBroker(
         initial_cash=10_000.0,
         fee_rate=0.001,
@@ -60,6 +61,7 @@ def make_runner() -> PaperTradingRunner:
         stop_policy=StopPolicy(
             atr_multiplier=1.5,
         ),
+        defer_execution=defer_execution,
     )
 
 
@@ -552,7 +554,7 @@ def test_short_stop_gap_uses_candle_open_price():
     )
 
 def test_runner_process_candles_accepts_candle_objects():
-    runner = make_runner()
+    runner = make_runner(defer_execution=True)
 
     timestamp = datetime(2026, 1, 1, 12, 0, 0)
 
@@ -598,6 +600,208 @@ def test_runner_process_candles_accepts_candle_objects():
         timestamp=timestamp,
     )
 
-    assert result.action == "OPEN"
-    assert result.execution is not None
-    assert result.execution.result.success
+    # New behavior: process_candles persists an ExecutionIntent instead of
+    # opening immediately. Verify pending intent persisted and no position
+    # was opened by the process_candles call.
+    assert result.action == "PERSISTED_INTENT"
+    assert result.execution is None
+
+    intents = intent_manager.load_pending_intents(status="PENDING")
+    assert any(i.symbol == "BTCUSDT" for i in intents)
+
+
+def test_signal_creates_pending_intent_and_does_not_open():
+    runner = make_runner(defer_execution=True)
+
+    timestamp = datetime(2026, 1, 1, 12, 0, 0)
+
+    class LongStrategy2:
+        def generate_signal(self, *, symbol, candles):
+            return TradingSignal(
+                symbol=symbol,
+                side="LONG",
+                price=candles[-1].close + 10.0,
+                timestamp=timestamp,
+                atr=2.0,
+            )
+
+    result = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[
+            {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "timestamp": timestamp}
+        ],
+        strategy=LongStrategy2(),
+        timestamp=timestamp,
+    )
+
+    assert result.action == "PERSISTED_INTENT"
+    # No open position yet
+    assert runner.execution_engine.position_manager.get_position("BTCUSDT") is None
+
+
+def test_next_candle_executes_pending_intent_and_marks_executed():
+    runner = make_runner(defer_execution=True)
+
+    t0 = datetime(2026, 1, 1, 12, 0, 0)
+    t1 = datetime(2026, 1, 1, 12, 1, 0)
+
+    class LongStrategy3:
+        def generate_signal(self, *, symbol, candles):
+            return TradingSignal(
+                symbol=symbol,
+                side="LONG",
+                price=candles[-1].close,
+                timestamp=t0,
+                atr=1.5,
+            )
+
+    # Create pending intent from t0
+    res = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[{"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "timestamp": t0}],
+        strategy=LongStrategy3(),
+        timestamp=t0,
+    )
+
+    assert res.action == "PERSISTED_INTENT"
+
+    # Next candle arrives at t1 -> should execute at open=102.0
+    class FlatStrategy2:
+        def generate_signal(self, *, symbol, candles):
+            return TradingSignal(
+                symbol=symbol,
+                side="FLAT",
+                price=0.0,
+                timestamp=t1,
+                atr=None,
+            )
+
+    res2 = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[
+            {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "timestamp": t0},
+            {"open": 102.0, "high": 103.0, "low": 101.0, "close": 102.0, "timestamp": t1},
+        ],
+        strategy=FlatStrategy2(),
+        timestamp=t1,
+    )
+
+    assert res2.action == "INTENT_EXECUTED"
+    # Position was opened at next candle open
+    pos = runner.execution_engine.position_manager.get_position("BTCUSDT")
+    assert pos is not None
+    assert pos.entry_price == 102.0
+
+    executed = intent_manager.load_pending_intents(status="EXECUTED")
+    assert any(i.intent_id for i in executed)
+
+
+def test_source_candle_does_not_execute_intent():
+    runner = make_runner(defer_execution=True)
+
+    t0 = datetime(2026, 1, 1, 12, 0, 0)
+
+    class LongStrategy4:
+        def generate_signal(self, *, symbol, candles):
+            return TradingSignal(symbol=symbol, side="LONG", price=100.0, timestamp=t0, atr=1.0)
+
+    # Create intent
+    res = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[{"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "timestamp": t0}],
+        strategy=LongStrategy4(),
+        timestamp=t0,
+    )
+
+    assert res.action == "PERSISTED_INTENT"
+
+    # Process the same single candle again (no later candle) -> should NOT execute
+    res2 = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[{"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "timestamp": t0}],
+        strategy=LongStrategy4(),
+        timestamp=t0,
+    )
+
+    # Expect no execution and no second intent created (duplicate prevented)
+    assert res2.action in {"HOLD", "PERSISTED_INTENT"}
+    assert runner.execution_engine.position_manager.get_position("BTCUSDT") is None
+
+
+def test_duplicate_processing_is_safe():
+    runner = make_runner(defer_execution=True)
+
+    t0 = datetime(2026, 1, 1, 12, 0, 0)
+    t1 = datetime(2026, 1, 1, 12, 1, 0)
+
+    class LongStrategy5:
+        def generate_signal(self, *, symbol, candles):
+            return TradingSignal(symbol=symbol, side="LONG", price=100.0, timestamp=t0, atr=1.0)
+
+    runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[{"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "timestamp": t0}],
+        strategy=LongStrategy5(),
+        timestamp=t0,
+    )
+
+    # execute once
+    res1 = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[
+            {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "timestamp": t0},
+            {"open": 105.0, "high": 106.0, "low": 104.0, "close": 105.0, "timestamp": t1},
+        ],
+        strategy=LongStrategy5(),
+        timestamp=t1,
+    )
+
+    assert res1.action == "INTENT_EXECUTED"
+
+    # process the same candles again: should not execute the same intent twice
+    res2 = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[
+            {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "timestamp": t0},
+            {"open": 105.0, "high": 106.0, "low": 104.0, "close": 105.0, "timestamp": t1},
+        ],
+        strategy=LongStrategy5(),
+        timestamp=t1,
+    )
+
+    # second processing should not create a duplicate position
+    assert runner.execution_engine.position_manager.get_position("BTCUSDT") is not None
+
+
+def test_strategy_price_is_ignored_on_execution():
+    runner = make_runner(defer_execution=True)
+
+    t0 = datetime(2026, 1, 1, 12, 0, 0)
+    t1 = datetime(2026, 1, 1, 12, 1, 0)
+
+    class PriceyStrategy:
+        def generate_signal(self, *, symbol, candles):
+            # Intentionally return a price that differs from the next candle open
+            return TradingSignal(symbol=symbol, side="LONG", price=9999.0, timestamp=t0, atr=1.0)
+
+    runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[{"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "timestamp": t0}],
+        strategy=PriceyStrategy(),
+        timestamp=t0,
+    )
+
+    res = runner.process_candles(
+        symbol="BTCUSDT",
+        candles=[
+            {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "timestamp": t0},
+            {"open": 123.45, "high": 124.0, "low": 122.0, "close": 123.45, "timestamp": t1},
+        ],
+        strategy=PriceyStrategy(),
+        timestamp=t1,
+    )
+
+    assert res.action == "INTENT_EXECUTED"
+    pos = runner.execution_engine.position_manager.get_position("BTCUSDT")
+    assert pos is not None
+    assert pos.entry_price == 123.45

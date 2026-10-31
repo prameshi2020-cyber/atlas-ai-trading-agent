@@ -6,6 +6,8 @@ from datetime import datetime
 from app.strategy.stop_policy import StopPolicy
 from app.market.models import Candle
 from app.trading.execution import ExecutionEngine, TradeExecution
+from app.trading import intent_manager
+from datetime import timezone
 
 
 @dataclass(slots=True)
@@ -26,9 +28,11 @@ class PaperTradingRunner:
         *,
         execution_engine: ExecutionEngine,
         stop_policy: StopPolicy,
+        defer_execution: bool = False,
     ) -> None:
         self.execution_engine = execution_engine
         self.stop_policy = stop_policy
+        self.defer_execution = defer_execution
 
     def open(
         self,
@@ -130,6 +134,10 @@ class PaperTradingRunner:
                 reason="candles cannot be empty",
             )
 
+        # DEBUG: show defer flag when processing candles
+        # (temporary during Step 3 development)
+        # print("DEBUG Runner.defer_execution:", self.defer_execution)
+
         candle_objects = [
             Candle(
                 symbol=symbol,
@@ -196,10 +204,83 @@ class PaperTradingRunner:
 
                 return close_result
 
-        signal = strategy.generate_signal(
-            symbol=symbol,
-            candles=candle_objects,
-        )
+        if self.defer_execution:
+            # --- Step 1: execute eligible pending intents first ---
+            pending = intent_manager.load_pending_intents(status="PENDING")
+
+            for intent in pending:
+                # Only consider intents for this symbol
+                if intent.symbol != symbol:
+                    continue
+
+                # Find the first candle in this batch that is strictly after the
+                # intent's source_candle_timestamp. That candle is the execution
+                # candle (next-open).
+                next_candle = None
+                for c in candle_objects:
+                    if c.timestamp > intent.source_candle_timestamp:
+                        next_candle = c
+                        break
+
+                if next_candle is None:
+                    continue
+
+                # Calculate stop price using the stored ATR and the execution price
+                entry_price = float(next_candle.open)
+                stop_price = self.stop_policy.calculate(
+                    side=intent.side,
+                    entry_price=entry_price,
+                    atr=intent.atr,
+                )
+
+                # Attempt execution using the next candle's open as the entry price
+                execution = self.execution_engine.open_position(
+                    symbol=intent.symbol,
+                    side=intent.side,
+                    entry_price=entry_price,
+                    stop_price=stop_price,
+                    timestamp=next_candle.timestamp,
+                )
+
+                # Mark intent executed or failed deterministically
+                if execution.result.success:
+                    executed_at = next_candle.timestamp
+                    intent_manager.update_status(
+                        intent_id=intent.intent_id,
+                        status="EXECUTED",
+                        executed_at=executed_at,
+                        trade_id=execution.trade_id,
+                    )
+
+                    return RunnerResult(
+                        action="INTENT_EXECUTED",
+                        execution=execution,
+                        reason="pending intent executed",
+                    )
+                else:
+                    intent_manager.update_status(
+                        intent_id=intent.intent_id,
+                        status="FAILED",
+                        executed_at=next_candle.timestamp,
+                        trade_id=None,
+                    )
+
+                    return RunnerResult(
+                        action="INTENT_FAILED",
+                        execution=execution,
+                        reason=execution.result.reason,
+                    )
+            # --- Step 2: now generate a signal for the latest closed candle ---
+            signal = strategy.generate_signal(
+                symbol=symbol,
+                candles=candle_objects,
+            )
+        else:
+            # Non-deferred behavior: preserve existing immediate-execution flow.
+            signal = strategy.generate_signal(
+                symbol=symbol,
+                candles=candle_objects,
+            )
 
         if signal.side == "FLAT":
             return RunnerResult(
@@ -222,6 +303,7 @@ class PaperTradingRunner:
                 reason="strategy signal is missing ATR",
             )
 
+        # Calculate the stop price using the signal metadata.
         stop_price = self.stop_policy.calculate(
             side=signal.side,
             entry_price=signal.price,
@@ -230,44 +312,75 @@ class PaperTradingRunner:
 
         latest_candle = candle_objects[-1]
 
-        try:
-            entry_price = float(latest_candle.close)
-        except (AttributeError, TypeError, ValueError):
-            return RunnerResult(
-                action="REJECT",
-                execution=None,
-                reason="invalid latest candle close",
-            )
+        if self.defer_execution:
+            # Duplicate intent prevention: do not create a second identical
+            # pending intent for the same symbol + source_candle_timestamp.
+            pending_for_symbol = [
+                p for p in intent_manager.load_pending_intents(status="PENDING")
+                if p.symbol == symbol
+            ]
 
-        if self.execution_engine.position_manager.has_position(symbol):
-            position = self.execution_engine.position_manager.get_position(
-                symbol
-            )
-
-            if position is not None and position.side == signal.side:
+            if any(p.source_candle_timestamp == latest_candle.timestamp for p in pending_for_symbol):
                 return RunnerResult(
                     action="HOLD",
                     execution=None,
-                    reason="existing position matches signal",
+                    reason="intent already exists",
                 )
 
-            close_result = self.close(
+            # Persist a new pending ExecutionIntent for later execution.
+            intent = intent_manager.create_intent(
                 symbol=symbol,
-                exit_price=entry_price,
-                timestamp=timestamp,
-                exit_reason="strategy reversal",
+                side=signal.side,
+                decision_timestamp=datetime.now(timezone.utc),
+                source_candle_timestamp=latest_candle.timestamp,
+                atr=signal.atr,
+                reason="strategy_signal",
             )
 
-            if close_result.execution is None:
-                return close_result
+            return RunnerResult(
+                action="PERSISTED_INTENT",
+                execution=None,
+                reason="pending intent persisted",
+            )
+        else:
+            # Non-deferred: use the latest candle close as entry price and
+            # proceed with the original immediate execution flow.
+            try:
+                entry_price = float(latest_candle.close)
+            except (AttributeError, TypeError, ValueError):
+                return RunnerResult(
+                    action="REJECT",
+                    execution=None,
+                    reason="invalid latest candle close",
+                )
 
-            if not close_result.execution.result.success:
-                return close_result
+            if self.execution_engine.position_manager.has_position(symbol):
+                position = self.execution_engine.position_manager.get_position(symbol)
 
-        return self.open(
-            symbol=symbol,
-            side=signal.side,
-            entry_price=entry_price,
-            stop_price=stop_price,
-            timestamp=timestamp,
-        )
+                if position is not None and position.side == signal.side:
+                    return RunnerResult(
+                        action="HOLD",
+                        execution=None,
+                        reason="existing position matches signal",
+                    )
+
+                close_result = self.close(
+                    symbol=symbol,
+                    exit_price=entry_price,
+                    timestamp=timestamp,
+                    exit_reason="strategy reversal",
+                )
+
+                if close_result.execution is None:
+                    return close_result
+
+                if not close_result.execution.result.success:
+                    return close_result
+
+            return self.open(
+                symbol=symbol,
+                side=signal.side,
+                entry_price=entry_price,
+                stop_price=stop_price,
+                timestamp=timestamp,
+            )
